@@ -1,0 +1,5 @@
+*.png
+*.jpeg
+*.jpg
+*.h5
+hugging_face_upload.py
