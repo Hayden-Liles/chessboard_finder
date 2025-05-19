@@ -4,17 +4,19 @@ from tqdm import tqdm
 
 # ─── CONFIG ───────────────────────────────────────────────────────────────────
 boards_dir   = "boards"
+boards_dot_dir = "boards_with_dot"
 sprites_dir  = "pieces"
-out_dir      = "data/train"
+out_dir      = "data2/train"
 
 PATCH_SIZE   = 244      # px
-N_VARIANTS   = 1000     # per sprite
+N_VARIANTS   = 1     # per sprite
 MAX_SHIFT    = 10       # max px to shift sprite
 MAX_CROP     = 8        # max px to crop from edges
 # ──────────────────────────────────────────────────────────────────────────────
 
 # 1) Build & resize background patches
 backgrounds = []
+backgrounds_dot = []
 orig_patch = None
 
 for bfile in os.listdir(boards_dir):
@@ -26,6 +28,16 @@ for bfile in os.listdir(boards_dir):
         for file in range(8):
             p = board.crop((file*sz, rank*sz, (file+1)*sz, (rank+1)*sz))
             backgrounds.append(p.resize((PATCH_SIZE, PATCH_SIZE), Image.LANCZOS))
+
+for bfile in os.listdir(boards_dot_dir):
+    board = Image.open(os.path.join(boards_dot_dir, bfile)).convert("RGBA")
+    sz = board.width // 8
+    if orig_patch is None:
+        orig_patch = sz
+    for rank in range(8):
+        for file in range(8):
+            p = board.crop((file*sz, rank*sz, (file+1)*sz, (rank+1)*sz))
+            backgrounds_dot.append(p.resize((PATCH_SIZE, PATCH_SIZE), Image.LANCZOS))
 
 scale = PATCH_SIZE / orig_patch
 
@@ -39,17 +51,22 @@ for style_folder in os.listdir(sprites_dir):
         if sprite_file.lower().endswith(('.png','.jpg','.jpeg')):
             sprite_entries.append((style_folder, sprite_file))
 
-# 3) Compute total tasks (empty + all sprite composites)
-total_empty = N_VARIANTS * 5
+# 3) Compute total tasks (empty + empty_dot + all sprite composites)
+total_empty = N_VARIANTS
+total_empty_dot = N_VARIANTS * 20000
 total_sprites = len(sprite_entries) * N_VARIANTS
-total_tasks = total_empty + total_sprites
+total_tasks = total_empty + total_empty_dot + total_sprites
 
 # 4) Run generation with a single tqdm bar
 pbar = tqdm(total=total_tasks, desc="Generating patches")
 
 # 4a) empty patches
 empty_dir = os.path.join(out_dir, "empty")
+empty_dot_dir = os.path.join(out_dir, "empty_dot")
 os.makedirs(empty_dir, exist_ok=True)
+os.makedirs(empty_dot_dir, exist_ok=True)
+
+# Regular empty patches
 for i in range(total_empty):
     bg = random.choice(backgrounds).copy()
     # random edge-crop
@@ -61,6 +78,20 @@ for i in range(total_empty):
     c = bg.crop((l, t, w-r, h-b))
     patch = c.resize((PATCH_SIZE, PATCH_SIZE), Image.LANCZOS)
     patch.convert("RGB").save(os.path.join(empty_dir, f"empty_{i}.jpg"))
+    pbar.update(1)
+
+# Dotted empty patches
+for i in range(total_empty_dot):
+    bg = random.choice(backgrounds_dot).copy()
+    # random edge-crop
+    l = random.randint(0, MAX_CROP)
+    t = random.randint(0, MAX_CROP)
+    r = random.randint(0, MAX_CROP)
+    b = random.randint(0, MAX_CROP)
+    w, h = bg.size
+    c = bg.crop((l, t, w-r, h-b))
+    patch = c.resize((PATCH_SIZE, PATCH_SIZE), Image.LANCZOS)
+    patch.convert("RGB").save(os.path.join(empty_dot_dir, f"empty_dot_{i}.jpg"))
     pbar.update(1)
 
 # 4b) composite sprites

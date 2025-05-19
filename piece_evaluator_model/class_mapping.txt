@@ -1,0 +1,15 @@
+Class index to name mapping:
+0: b_b
+1: b_w
+2: empty
+3: empty_dot
+4: k_b
+5: k_w
+6: n_b
+7: n_w
+8: p_b
+9: p_w
+10: q_b
+11: q_w
+12: r_b
+13: r_w

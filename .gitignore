@@ -2,4 +2,11 @@
 *.jpeg
 *.jpg
 *.h5
+*.keras
+*.mp4
+*.mp4.part
+*.v2
+*.srt
+*.metadata
+*/videos/*
 hugging_face_upload.py

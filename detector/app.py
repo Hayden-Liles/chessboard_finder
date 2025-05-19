@@ -21,7 +21,17 @@ import argparse
 from itertools import combinations
 import tensorflow as tf
 import os
+import json
 
+class Normalizer(tf.keras.layers.Layer):
+    def call(self, inputs):
+        return inputs / 255.0
+
+    def get_config(self):
+        return super().get_config()
+
+# We'll refer to this function by name when loading:
+_PREPROCESS_FN = tf.keras.applications.mobilenet_v2.preprocess_input
 
 def order_points(pts):
     """Order points in clockwise order: top-left, top-right, bottom-right, bottom-left."""
@@ -352,126 +362,75 @@ def detect_piece_position(warped_img, x, y):
 
 def analyze_chess_position(warped_img, model_path, orientation=0, debug=False):
     """
-    Analyze the chess position by identifying pieces on each square.
-    
-    Args:
-        warped_img: Warped chessboard image
-        model_path: Path to the chess piece CNN model
-        orientation: Board orientation (0-3)
-        debug: Whether to save debug images
-        
-    Returns:
-        position: Dictionary mapping square notation to piece type
-        visual: Annotated image showing pieces detected
-        fen: Forsyth-Edwards Notation of the position
+    Identify all 64 squares, classify each via the CNN, and return:
+      - position dict (e.g. {'a1': 'k_w', …})
+      - a visual overlay image
+      - a FEN string
     """
-    # Define the custom Normalizer layer for loading the model
-    class Normalizer(tf.keras.layers.Layer):
-        def __init__(self, **kwargs):
-            super(Normalizer, self).__init__(**kwargs)
-        
-        def call(self, inputs):
-            return inputs / 255.0
-        
-        def get_config(self):
-            config = super(Normalizer, self).get_config()
-            return config
-    
-    # Try to load the model with custom layer
-    try:
-        with tf.keras.utils.custom_object_scope({'Normalizer': Normalizer}):
-            model = tf.keras.models.load_model(model_path)
-            print(f"Successfully loaded model from {model_path}")
-    except Exception as e:
-        print(f"Error loading model: {e}")
-        
-        # Try with Lambda layer as fallback
-        try:
-            custom_objects = {
-                'Normalizer': tf.keras.layers.Lambda(lambda x: x / 255.0)
-            }
-            with tf.keras.utils.custom_object_scope(custom_objects):
-                model = tf.keras.models.load_model(model_path, compile=False)
-                print("Successfully loaded model using Lambda layer fallback")
-        except Exception as e2:
-            print(f"Both loading methods failed: {e2}")
-            return None, warped_img, None
-    
-    # Process the warped board image
+    # ──────────────────────────────────────────────────────────────────────────
+    # 1) load the model, registering both the old Normalizer and preprocess_input
+    custom_objects = {
+        'Normalizer': Normalizer,
+        'preprocess_input': _PREPROCESS_FN
+    }
+    model = tf.keras.models.load_model(
+        model_path,
+        custom_objects=custom_objects,
+        compile=False
+    )
+    # ──────────────────────────────────────────────────────────────────────────
+
+    # 2) load metadata for class->name mapping
+    meta_path = os.path.splitext(model_path)[0] + ".keras.metadata"
+    print(f"meta_path", meta_path)
+    with open(meta_path, "r") as f:
+        meta = json.load(f)
+    class_names = [meta["class_mapping"][str(i)] 
+                   for i in range(len(meta["class_mapping"]))]
+
+    # 3) prep sizes & containers
     h, w = warped_img.shape[:2]
-    square_size = h // 8
-    
-    # Create a copy of the image for visualization
+    sz = h // 8
     visual = warped_img.copy()
-    
-    # Get the square mapping based on orientation
     square_map = get_square_mapping(orientation)
-    
-    # Create a dictionary to store the position
     position = {}
-    
-    # Create a directory to save individual square images if debugging
     if debug:
-        os.makedirs('squares', exist_ok=True)
-    
-    # Process each square
+        os.makedirs("squares", exist_ok=True)
+
+    # 4) loop through each square, preprocess & predict
     for row in range(8):
         for col in range(8):
-            # Extract the square
-            y1, y2 = row * square_size, (row + 1) * square_size
-            x1, x2 = col * square_size, (col + 1) * square_size
-            square_img = warped_img[y1:y2, x1:x2]
-            
-            # Save the square image for debugging
+            x1, y1 = col * sz, row * sz
+            sq = warped_img[y1:y1+sz, x1:x1+sz]
+
+            # → BGR→RGB, resize, float, preprocess, batch
+            proc = cv2.resize(sq, (100, 100))
+            proc = cv2.cvtColor(proc, cv2.COLOR_BGR2RGB).astype(np.float32)
+            # proc = _PREPROCESS_FN(proc)
+            proc = np.expand_dims(proc, 0)
+
+            # predict
+            pred = model.predict(proc, verbose=0)[0]
+            idx = int(np.argmax(pred))
+            piece = class_names[idx]
+            position[square_map[(row, col)]] = piece
+
+            # annotate non‐empty
+            if piece not in ("unknown", "error"):
+                cx, cy = x1 + sz//2, y1 + sz//2
+                bri = np.mean(sq)
+                colr = (0,0,0) if bri > 128 else (255,255,255)
+                text = get_short_piece_notation(piece)
+                cv2.putText(visual, text, (cx-10, cy+5),
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.7, colr, 2)
+
             if debug:
-                notation = square_map[(row, col)]
-                cv2.imwrite(f'squares/square_{notation}.png', square_img)
-            
-            # Preprocess for the model
-            # Resize to expected input size (100x100)
-            processed_img = cv2.resize(square_img, (100, 100))
-            
-            # Handle grayscale images (convert to RGB)
-            if len(processed_img.shape) == 2:
-                processed_img = cv2.cvtColor(processed_img, cv2.COLOR_GRAY2RGB)
-            elif processed_img.shape[2] == 1:
-                processed_img = cv2.cvtColor(processed_img, cv2.COLOR_GRAY2RGB)
-            
-            # Add batch dimension (no need to normalize as it's handled by model)
-            processed_img = np.expand_dims(processed_img, axis=0)
-            
-            # Predict the piece
-            try:
-                prediction = model.predict(processed_img, verbose=0)
-                piece_type = decode_prediction(prediction)
-            except Exception as e:
-                print(f"Error predicting square at {row}, {col}: {e}")
-                piece_type = 'error'
-            
-            # Get square notation
-            notation = square_map[(row, col)]
-            
-            # Store the result
-            position[notation] = piece_type
-            
-            # Annotate the visual with piece type
-            if piece_type not in ['empty', 'error', 'unknown']:
-                center_x = int((col + 0.5) * square_size)
-                center_y = int((row + 0.5) * square_size)
-                
-                # Choose text color for visibility
-                avg_brightness = np.mean(square_img)
-                text_color = (0, 0, 0) if avg_brightness > 128 else (255, 255, 255)
-                
-                # Use a shorter piece notation for visual clarity
-                short_notation = get_short_piece_notation(piece_type)
-                cv2.putText(visual, short_notation, (center_x-10, center_y+5),
-                            cv2.FONT_HERSHEY_SIMPLEX, 0.7, text_color, 2)
-    
-    # Generate FEN representation
+                cv2.imwrite(f"squares/{row}_{col}.png", sq)
+
+    # 5) build FEN and return
     fen = position_to_fen(position, orientation)
-    
     return position, visual, fen
+
 
 
 def decode_prediction(prediction):
@@ -490,13 +449,12 @@ def decode_prediction(prediction):
 
         print(f"Predicted class index: {class_idx}, confidence: {confidence:.2f}")
 
-        # Define class names based on typical alphabetical sorting of folders
-        # You may need to adjust this based on your actual class indices
+        # Define class names for the 14-class model
         class_names = [
-            'b_b', 'b_w', 'empty', 
+            'b_b', 'b_w', 'empty', 'empty_dot',
             'k_b', 'k_w', 'n_b', 'n_w',
             'p_b', 'p_w', 'q_b', 'q_w',
-            'r_b', 'r_w'
+            'r_b', 'r_w', 'unknown'  # The 14th class
         ]
         
         # Make sure class_idx is within range of class_names
@@ -516,7 +474,7 @@ def get_short_piece_notation(piece_type):
     piece_map = {
         'p_w': 'wP', 'n_w': 'wN', 'b_w': 'wB', 'r_w': 'wR', 'q_w': 'wQ', 'k_w': 'wK',
         'p_b': 'bP', 'n_b': 'bN', 'b_b': 'bB', 'r_b': 'bR', 'q_b': 'bQ', 'k_b': 'bK',
-        'empty': '',
+        'empty': '', 'empty_dot': '',
     }
     
     return piece_map.get(piece_type, piece_type)
@@ -531,7 +489,7 @@ def position_to_fen(position, orientation=0):
     fen_map = {
         'p_w': 'P', 'n_w': 'N', 'b_w': 'B', 'r_w': 'R', 'q_w': 'Q', 'k_w': 'K',
         'p_b': 'p', 'n_b': 'n', 'b_b': 'b', 'r_b': 'r', 'q_b': 'q', 'k_b': 'k',
-        'empty': '1', 'error': '1', 'unknown': '1'
+        'empty': '1', 'error': '1', 'unknown': '1', 'empty_dot': '1'
     }
     
     # Generate a board representation
@@ -622,7 +580,7 @@ def main():
             print("\nDetected pieces:")
             empty_count = 0
             for notation, piece in sorted(position.items()):
-                if piece not in ['empty', 'error', 'unknown']:
+                if piece not in ['empty', 'error', 'unknown', 'empty_dot']:
                     print(f"{notation}: {piece}")
                 else:
                     empty_count += 1
