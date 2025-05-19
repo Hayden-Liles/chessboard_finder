@@ -353,61 +353,67 @@ def detect_piece_position(warped_img, x, y):
 def analyze_chess_position(warped_img, model_path, orientation=0, debug=False):
     """
     Analyze the chess position by identifying pieces on each square.
-
+    
     Args:
         warped_img: Warped chessboard image
         model_path: Path to the chess piece CNN model
         orientation: Board orientation (0-3)
         debug: Whether to save debug images
-
+        
     Returns:
         position: Dictionary mapping square notation to piece type
         visual: Annotated image showing pieces detected
         fen: Forsyth-Edwards Notation of the position
     """
-    # Load the chess piece model
+    # Define the custom Normalizer layer for loading the model
+    class Normalizer(tf.keras.layers.Layer):
+        def __init__(self, **kwargs):
+            super(Normalizer, self).__init__(**kwargs)
+        
+        def call(self, inputs):
+            return inputs / 255.0
+        
+        def get_config(self):
+            config = super(Normalizer, self).get_config()
+            return config
+    
+    # Try to load the model with custom layer
     try:
-        # Try to load the model directly
-        model = tf.keras.models.load_model(model_path, compile=False)
-        print(f"Successfully loaded model from {model_path}")
+        with tf.keras.utils.custom_object_scope({'Normalizer': Normalizer}):
+            model = tf.keras.models.load_model(model_path)
+            print(f"Successfully loaded model from {model_path}")
     except Exception as e:
         print(f"Error loading model: {e}")
-
-        # Try a different approach - create a custom preprocessing function
+        
+        # Try with Lambda layer as fallback
         try:
-            # Load the model with custom preprocessing
-            preprocessing = lambda x: x / 255.0
-
-            # Create a wrapper model that applies preprocessing
-            base_model = tf.keras.models.load_model(model_path, compile=False)
-
-            # Create a new model that includes preprocessing
-            inputs = tf.keras.Input(shape=(100, 100, 3))
-            x = tf.keras.layers.Lambda(lambda x: x / 255.0)(inputs)
-            outputs = base_model(x)
-            model = tf.keras.Model(inputs=inputs, outputs=outputs)
-
-            print(f"Successfully created preprocessing wrapper model")
+            custom_objects = {
+                'Normalizer': tf.keras.layers.Lambda(lambda x: x / 255.0)
+            }
+            with tf.keras.utils.custom_object_scope(custom_objects):
+                model = tf.keras.models.load_model(model_path, compile=False)
+                print("Successfully loaded model using Lambda layer fallback")
         except Exception as e2:
             print(f"Both loading methods failed: {e2}")
             return None, warped_img, None
-
+    
+    # Process the warped board image
     h, w = warped_img.shape[:2]
     square_size = h // 8
-
+    
     # Create a copy of the image for visualization
     visual = warped_img.copy()
-
+    
     # Get the square mapping based on orientation
     square_map = get_square_mapping(orientation)
-
+    
     # Create a dictionary to store the position
     position = {}
-
+    
     # Create a directory to save individual square images if debugging
     if debug:
         os.makedirs('squares', exist_ok=True)
-
+    
     # Process each square
     for row in range(8):
         for col in range(8):
@@ -415,28 +421,25 @@ def analyze_chess_position(warped_img, model_path, orientation=0, debug=False):
             y1, y2 = row * square_size, (row + 1) * square_size
             x1, x2 = col * square_size, (col + 1) * square_size
             square_img = warped_img[y1:y2, x1:x2]
-
+            
             # Save the square image for debugging
             if debug:
                 notation = square_map[(row, col)]
                 cv2.imwrite(f'squares/square_{notation}.png', square_img)
-
+            
             # Preprocess for the model
-            # Resize to expected input size of MobileNetV2 (100x100 based on the training script)
+            # Resize to expected input size (100x100)
             processed_img = cv2.resize(square_img, (100, 100))
-
+            
             # Handle grayscale images (convert to RGB)
             if len(processed_img.shape) == 2:
                 processed_img = cv2.cvtColor(processed_img, cv2.COLOR_GRAY2RGB)
             elif processed_img.shape[2] == 1:
                 processed_img = cv2.cvtColor(processed_img, cv2.COLOR_GRAY2RGB)
-
-            # Normalize pixel values to [0, 1]
-            processed_img = processed_img / 255.0
-
-            # Add batch dimension
+            
+            # Add batch dimension (no need to normalize as it's handled by model)
             processed_img = np.expand_dims(processed_img, axis=0)
-
+            
             # Predict the piece
             try:
                 prediction = model.predict(processed_img, verbose=0)
@@ -444,30 +447,30 @@ def analyze_chess_position(warped_img, model_path, orientation=0, debug=False):
             except Exception as e:
                 print(f"Error predicting square at {row}, {col}: {e}")
                 piece_type = 'error'
-
+            
             # Get square notation
             notation = square_map[(row, col)]
-
+            
             # Store the result
             position[notation] = piece_type
-
+            
             # Annotate the visual with piece type
-            if piece_type not in ['empty', 'error']:
+            if piece_type not in ['empty', 'error', 'unknown']:
                 center_x = int((col + 0.5) * square_size)
                 center_y = int((row + 0.5) * square_size)
-
+                
                 # Choose text color for visibility
                 avg_brightness = np.mean(square_img)
                 text_color = (0, 0, 0) if avg_brightness > 128 else (255, 255, 255)
-
+                
                 # Use a shorter piece notation for visual clarity
                 short_notation = get_short_piece_notation(piece_type)
                 cv2.putText(visual, short_notation, (center_x-10, center_y+5),
                             cv2.FONT_HERSHEY_SIMPLEX, 0.7, text_color, 2)
-
+    
     # Generate FEN representation
     fen = position_to_fen(position, orientation)
-
+    
     return position, visual, fen
 
 
@@ -487,22 +490,22 @@ def decode_prediction(prediction):
 
         print(f"Predicted class index: {class_idx}, confidence: {confidence:.2f}")
 
-        # Define class names based on the model's classes using p_w, p_b naming convention
-        # This is based on the class order in the training script
+        # Define class names based on typical alphabetical sorting of folders
+        # You may need to adjust this based on your actual class indices
         class_names = [
-            'b_b', 'b_w', 'empty',
+            'b_b', 'b_w', 'empty', 
             'k_b', 'k_w', 'n_b', 'n_w',
             'p_b', 'p_w', 'q_b', 'q_w',
             'r_b', 'r_w'
         ]
-
+        
         # Make sure class_idx is within range of class_names
         if class_idx < len(class_names):
             return class_names[class_idx]
         else:
             print(f"Warning: Class index {class_idx} is out of range for class_names")
             return "unknown"
-
+    
     # For other output formats, add appropriate handling
     return "unknown"
 
@@ -515,7 +518,7 @@ def get_short_piece_notation(piece_type):
         'p_b': 'bP', 'n_b': 'bN', 'b_b': 'bB', 'r_b': 'bR', 'q_b': 'bQ', 'k_b': 'bK',
         'empty': '',
     }
-
+    
     return piece_map.get(piece_type, piece_type)
 
 
@@ -530,17 +533,17 @@ def position_to_fen(position, orientation=0):
         'p_b': 'p', 'n_b': 'n', 'b_b': 'b', 'r_b': 'r', 'q_b': 'q', 'k_b': 'k',
         'empty': '1', 'error': '1', 'unknown': '1'
     }
-
+    
     # Generate a board representation
     board = []
     for rank in range(8, 0, -1):  # FEN starts at rank 8
         rank_str = ''
         empty_count = 0
-
+        
         for file in 'abcdefgh':
             square = file + str(rank)
             piece = position.get(square, 'empty')
-
+            
             if piece in ['empty', 'error', 'unknown']:
                 empty_count += 1
             else:
@@ -548,19 +551,19 @@ def position_to_fen(position, orientation=0):
                     rank_str += str(empty_count)
                     empty_count = 0
                 rank_str += fen_map.get(piece, '1')
-
+        
         if empty_count > 0:
             rank_str += str(empty_count)
-
+            
         board.append(rank_str)
-
+    
     # Join ranks with slashes
     fen = '/'.join(board)
-
+    
     # Add other FEN components (to make it a valid FEN)
     # For now, just assume it's white to move, both sides can castle, no en passant, etc.
     fen += " w KQkq - 0 1"
-
+    
     return fen
 
 

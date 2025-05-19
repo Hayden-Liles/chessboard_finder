@@ -1,675 +1,442 @@
-#!/usr/bin/env python3
 """
-Digital chessboard detection with orientation recognition, square labeling, and piece identification.
-
-This script detects a chess board in an image, determines its orientation,
-labels all squares with proper chess notation (a1-h8), and identifies chess pieces
-using a CNN model.
-
-Steps:
-1. Detect the board using color segmentation
-2. Determine orientation by analyzing corner square colors
-3. Label all 64 squares with proper chess notation
-4. Identify the chess pieces on each square using a CNN model
-5. Output annotated images showing the detected board and pieces
-
-Usage:
-    python chess_board_detector.py path/to/image.png --model chess_piece_model.h5 --clusters 4 --downscale 800 --debug
+Train a CNN model for chess piece recognition, with support for continuing training
+from a previously trained model.
 """
-import cv2
-import numpy as np
-import argparse
-from itertools import combinations
 import tensorflow as tf
+import numpy as np
 import os
+import matplotlib.pyplot as plt
+from tensorflow.keras.callbacks import ModelCheckpoint, EarlyStopping, ReduceLROnPlateau
+from tensorflow.keras.preprocessing.image import ImageDataGenerator
+import json
+import datetime
 
+# Define a custom preprocessing layer
+class Normalizer(tf.keras.layers.Layer):
+    def __init__(self, **kwargs):
+        super(Normalizer, self).__init__(**kwargs)
+    
+    def call(self, inputs):
+        return inputs / 255.0
+    
+    def get_config(self):
+        config = super(Normalizer, self).get_config()
+        return config
 
-def order_points(pts):
-    """Order points in clockwise order: top-left, top-right, bottom-right, bottom-left."""
-    rect = np.zeros((4,2), dtype="float32")
-    s = pts.sum(axis=1)
-    rect[0] = pts[np.argmin(s)]  # TL
-    rect[2] = pts[np.argmax(s)]  # BR
-    diff = np.diff(pts, axis=1)
-    rect[1] = pts[np.argmin(diff)]  # TR
-    rect[3] = pts[np.argmax(diff)]  # BL
-    return rect
+def create_model(num_classes, input_shape=(100, 100, 3)):
+    """Create a MobileNetV2-based model for chess piece recognition."""
+    # Input layer
+    inputs = tf.keras.layers.Input(shape=input_shape, name="input_image")
+    
+    # Add preprocessing (normalization) as part of the model
+    x = Normalizer(name="normalizer")(inputs)
+    
+    # Base model - MobileNetV2 for feature extraction
+    base_model = tf.keras.applications.MobileNetV2(
+        input_shape=input_shape,
+        include_top=False,  # Don't include the classification head
+        weights='imagenet',  # Use ImageNet pre-trained weights
+    )
+    
+    # Freeze the base model layers to start with
+    base_model.trainable = False
+    
+    # Apply the base model to input
+    x = base_model(x)
+    
+    # Add classification head
+    x = tf.keras.layers.GlobalAveragePooling2D(name="global_average_pooling2d")(x)
+    x = tf.keras.layers.Dropout(0.2, name="dropout")(x)
+    outputs = tf.keras.layers.Dense(num_classes, activation="softmax", name="piece_prediction")(x)
+    
+    # Create the complete model
+    model = tf.keras.models.Model(inputs=inputs, outputs=outputs)
+    
+    # Compile the model
+    model.compile(
+        optimizer=tf.keras.optimizers.Adam(learning_rate=0.001),
+        loss='categorical_crossentropy',
+        metrics=['accuracy']
+    )
+    
+    return model
 
-
-def extract_board_region(img, k=4, sample_size=10000, debug=False):
-    """Extract chessboard corner points using color segmentation."""
-    h, w = img.shape[:2]
-
-    # 1) run k-means color clustering
-    coords = np.random.choice(h*w, min(sample_size, h*w), replace=False)
-    pixels = img.reshape(-1,3)[coords].astype(np.float32)
-    criteria = (cv2.TERM_CRITERIA_EPS + cv2.TERM_CRITERIA_MAX_ITER, 50, 1.0)
-    _, _, centers = cv2.kmeans(pixels, k, None, criteria, 3, cv2.KMEANS_PP_CENTERS)
-    centers = centers.astype(np.uint8)
-    all_pixels = img.reshape(-1,3).astype(np.float32)
-    dists = np.linalg.norm(all_pixels[:,None] - centers[None,:], axis=2)
-    full_labels = np.argmin(dists, axis=1).reshape(h, w)
-
-    # 2) try every pair of clusters (i,j), build a mask and score by how square the largest contour is
-    best_score = float('inf')
-    best_box = None
-    for i, j in combinations(range(k), 2):
-        # build binary mask of these two clusters
-        mask = np.zeros((h, w), np.uint8)
-        mask[np.logical_or(full_labels==i, full_labels==j)] = 255
-
-        # clean it up
-        kern = cv2.getStructuringElement(cv2.MORPH_RECT, (15,15))
-        mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, kern)
-        mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN,  kern)
-
-        # find the biggest blob
-        cnts, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-        if not cnts: 
-            continue
-        cnt = max(cnts, key=cv2.contourArea)
-
-        # ignore tiny specks
-        area = cv2.contourArea(cnt)
-        if area < 0.01 * (h*w):
-            continue
-
-        # fit rotated rect and compute how far its aspect‐ratio deviates from 1.0
-        rect = cv2.minAreaRect(cnt)
-        (cx,cy),(bw,bh),angle = rect
-        aspect = max(bw,bh)/min(bw,bh)
-        score = abs(1.0 - aspect)
-
-        # heavily penalize masks that cover almost the whole image or almost nothing
-        ar = area / float(h*w)
-        if ar > 0.9 or ar < 0.02:
-            score += 1.0
-
-        if score < best_score:
-            best_score = score
-            best_box = cv2.boxPoints(rect).astype(np.float32)
-
-            if debug:
-                debug_mask = img.copy()
-                cv2.drawContours(debug_mask, [cnt], -1, (0, 255, 0), 2)
-                cv2.imwrite(f'debug_mask_{i}_{j}.png', debug_mask)
-
-    if best_box is None:
+def load_existing_model(model_path):
+    """Load an existing model with custom layers."""
+    try:
+        custom_objects = {'Normalizer': Normalizer}
+        model = tf.keras.models.load_model(model_path, custom_objects=custom_objects)
+        print(f"Successfully loaded existing model from {model_path}")
+        return model
+    except Exception as e:
+        print(f"Error loading existing model: {e}")
         return None
 
-    if debug:
-        vis = img.copy()
-        for i, (x, y) in enumerate(best_box):
-            color = [(0,0,255), (0,255,0), (255,0,0), (255,255,0)][i]  # different color for each corner
-            cv2.circle(vis, (int(x),int(y)), 10, color, -1)
-            cv2.putText(vis, f"Corner {i}", (int(x)-10, int(y)-10), 
-                        cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255,255,255), 2)
-        cv2.imwrite('corners_color.png', vis)
-
-    return best_box
-
-
-def warp_and_draw(img, pts, size=800, thickness=2):
-    """Warp the board to a square and overlay an 8x8 grid."""
-    rect = order_points(pts)
-    dst = np.array([[0,0],[size-1,0],[size-1,size-1],[0,size-1]], dtype="float32")
-    M = cv2.getPerspectiveTransform(rect, dst)
-    warp = cv2.warpPerspective(img, M, (size, size))
-
-    overlay = np.zeros_like(warp)
-    step = size // 8
-    for i in range(9):
-        cv2.line(overlay, (i*step,0), (i*step,size), (0,255,0), thickness)
-        cv2.line(overlay, (0,i*step), (size,i*step), (0,255,0), thickness)
-
-    back = cv2.warpPerspective(overlay, np.linalg.inv(M),
-                              (img.shape[1], img.shape[0]),
-                              flags=cv2.INTER_LINEAR,
-                              borderMode=cv2.BORDER_CONSTANT)
-    result = img.copy()
-    mask = back.sum(axis=2) > 0
-    result[mask] = back[mask]
-    return result, warp, M
-
-
-def determine_orientation(warped_img, debug=False):
-    """
-    Determine board orientation by analyzing corner square colors.
-    In standard chess orientation, the "white square in the right" rule applies:
-    - Bottom-right (H1) is white
-    - Top-left (A8) is white
-    - Bottom-left (A1) is black
-    - Top-right (H8) is black
+def train_chess_piece_model(data_dir, output_model_path, existing_model_path=None, 
+                           input_size=(100, 100), batch_size=32, epochs=50, 
+                           unfreeze_base=True, continue_epoch=0):
+    """Train a chess piece recognition model, optionally continuing from an existing model."""
+    print(f"Training chess piece recognition model using data from: {data_dir}")
+    print(f"Model will be saved to: {output_model_path}")
     
-    Returns an orientation code:
-    0 - Standard orientation (A1 is bottom-left, black)
-    1 - Rotated 90° clockwise (A1 is top-left, black)
-    2 - Rotated 180° (A1 is top-right, black) 
-    3 - Rotated 270° clockwise (A1 is bottom-right, black)
+    # Load metadata from previous training if continuing
+    previous_class_mapping = None
+    if existing_model_path and os.path.exists(existing_model_path + '.metadata'):
+        try:
+            with open(existing_model_path + '.metadata', 'r') as f:
+                metadata = json.load(f)
+                previous_class_mapping = metadata.get('class_mapping', {})
+                print(f"Loaded previous class mapping with {len(previous_class_mapping)} classes")
+        except Exception as e:
+            print(f"Warning: Could not load previous metadata: {e}")
     
-    Note: This only determines the board orientation for chess notation.
-    It cannot determine which player (white/black) is playing from which side
-    without analyzing the pieces.
-    """
-    h, w = warped_img.shape[:2]
-    square_size = h // 8
+    # Data augmentation for training
+    train_datagen = ImageDataGenerator(
+        validation_split=0.2,  # 20% for validation
+        rotation_range=10,     # Rotate images slightly
+        width_shift_range=0.1, # Shift horizontally
+        height_shift_range=0.1,# Shift vertically
+        zoom_range=0.1,        # Zoom in/out slightly
+        brightness_range=[0.9, 1.1],  # Adjust brightness
+        horizontal_flip=False, # Don't flip chess pieces (could confuse bishop/knight/etc)
+        fill_mode='nearest'    # Fill in missing pixels after transformations
+    )
     
-    # Sample colors from the 4 corner squares (offset from absolute corners to avoid grid lines)
-    offset = square_size // 4
+    # Load training data
+    train_generator = train_datagen.flow_from_directory(
+        data_dir,
+        target_size=input_size,
+        batch_size=batch_size,
+        class_mode='categorical',
+        subset='training',
+        shuffle=True
+    )
     
-    # Corner indices in order: Top-left, Top-right, Bottom-right, Bottom-left
-    corners = [
-        (offset, offset),                   # Top-left (a8 in standard orientation)
-        (w - offset, offset),               # Top-right (h8 in standard orientation)
-        (w - offset, h - offset),           # Bottom-right (h1 in standard orientation)
-        (offset, h - offset)                # Bottom-left (a1 in standard orientation)
+    # Load validation data
+    validation_generator = train_datagen.flow_from_directory(
+        data_dir,
+        target_size=input_size,
+        batch_size=batch_size,
+        class_mode='categorical',
+        subset='validation',
+        shuffle=False
+    )
+    
+    # Get current class indices and names
+    class_indices = train_generator.class_indices
+    class_names = {v: k for k, v in class_indices.items()}
+    
+    # Check class consistency if continuing from an existing model
+    if previous_class_mapping:
+        mismatch = False
+        for idx, name in previous_class_mapping.items():
+            if int(idx) < len(class_names) and class_names[int(idx)] != name:
+                print(f"⚠️ Class index mismatch: Previous {idx}: {name}, Current {idx}: {class_names[int(idx)]}")
+                mismatch = True
+        
+        if mismatch:
+            print("WARNING: Class mapping has changed between training sessions!")
+            print("This may cause incorrect predictions. Consider:")
+            print("1. Organizing your data directories to maintain the same class order")
+            print("2. Starting fresh with a new model instead of continuing training")
+            user_input = input("Continue anyway? (y/n): ")
+            if user_input.lower() != 'y':
+                print("Training aborted.")
+                return None, None
+    
+    # Print class mapping
+    print("\nClass mapping:")
+    for idx, class_name in class_names.items():
+        print(f"  {idx}: {class_name}")
+    
+    # Save class mapping to a metadata file
+    metadata = {
+        'class_mapping': {str(k): v for k, v in class_names.items()},
+        'training_data': data_dir,
+        'input_size': input_size,
+        'last_trained': datetime.datetime.now().isoformat()
+    }
+    
+    with open(output_model_path + '.metadata', 'w') as f:
+        json.dump(metadata, f, indent=2)
+    
+    # Also save as readable text file
+    with open('class_mapping.txt', 'w') as f:
+        f.write("Class index to name mapping:\n")
+        for idx, class_name in class_names.items():
+            f.write(f"{idx}: {class_name}\n")
+    
+    # Create or load the model
+    num_classes = len(class_indices)
+    if existing_model_path and os.path.exists(existing_model_path):
+        model = load_existing_model(existing_model_path)
+        if model is None:
+            print("Failed to load existing model. Creating new one.")
+            model = create_model(num_classes, input_size + (3,))
+        else:
+            # Check if output layer matches the number of classes
+            output_layer = model.layers[-1]
+            if output_layer.output_shape[-1] != num_classes:
+                print(f"⚠️ Output layer has {output_layer.output_shape[-1]} units but data has {num_classes} classes!")
+                print("Cannot continue training with mismatched class count.")
+                return None, None
+            
+            # Recompile with fresh optimizer for continued training
+            model.compile(
+                optimizer=tf.keras.optimizers.Adam(learning_rate=0.0001),  # Lower learning rate for fine-tuning
+                loss='categorical_crossentropy',
+                metrics=['accuracy']
+            )
+    else:
+        # Create new model
+        model = create_model(num_classes, input_size + (3,))
+    
+    # Print model summary
+    model.summary()
+    
+    # Set up callbacks
+    callbacks = [
+        # Save best model
+        ModelCheckpoint(
+            filepath=output_model_path,
+            monitor='val_accuracy',
+            save_best_only=True,
+            verbose=1
+        ),
+        # Stop early if no improvement
+        EarlyStopping(
+            monitor='val_accuracy',
+            patience=10,
+            restore_best_weights=True,
+            verbose=1
+        ),
+        # Reduce learning rate when plateau
+        ReduceLROnPlateau(
+            monitor='val_loss',
+            factor=0.5,
+            patience=5,
+            min_lr=1e-6,
+            verbose=1
+        )
     ]
     
-    # Sample inner points of each corner square to get more reliable color
-    corner_squares = []
-    for x, y in corners:
-        # Take 5x5 grid of samples in each corner square
-        samples = []
-        for dx in range(-offset//2, offset//2+1, offset//4):
-            for dy in range(-offset//2, offset//2+1, offset//4):
-                samples.append(warped_img[int(y+dy), int(x+dx)])
+    # Calculate steps per epoch
+    steps_per_epoch = train_generator.samples // batch_size
+    validation_steps = validation_generator.samples // batch_size
+    
+    # If continuing training, we can go directly to fine-tuning
+    initial_epoch = continue_epoch
+    
+    # Training strategy
+    if existing_model_path and os.path.exists(existing_model_path):
+        print("\nContinuing training from existing model...")
         
-        # Average color of corner square
-        corner_squares.append(np.mean(samples, axis=0))
-    
-    # Convert to brightness and determine if each corner is white
-    brightness = [np.mean(color) for color in corner_squares]
-    
-    # Sort brightness to determine threshold (midpoint between light and dark)
-    sorted_bright = sorted(brightness)
-    threshold = (sorted_bright[1] + sorted_bright[2]) / 2
-    
-    # Determine if each corner is white
-    is_white = [b > threshold for b in brightness]
-    
-    if debug:
-        debug_img = warped_img.copy()
-        for i, (x, y) in enumerate(corners):
-            color = (0, 255, 0) if is_white[i] else (0, 0, 255)  # Green for white, Red for black
-            cv2.circle(debug_img, (int(x), int(y)), 10, color, -1)
-            cv2.putText(debug_img, f"{'W' if is_white[i] else 'B'}", (int(x)-5, int(y)+5), 
-                        cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 255), 2)
-        cv2.imwrite('corner_colors.png', debug_img)
-    
-    # Check orientation based on the pattern of white and black squares
-    # In a standard chess board:
-    # - TL: white (A8)
-    # - TR: black (H8)
-    # - BR: white (H1)
-    # - BL: black (A1)
-    
-    # Standard orientation (A1 at bottom-left)
-    if is_white[0] and not is_white[1] and is_white[2] and not is_white[3]:
-        return 0
-    
-    # Rotated 90° clockwise (A1 at top-left)
-    elif not is_white[0] and is_white[1] and not is_white[2] and is_white[3]:
-        return 1
-    
-    # Rotated 180° (A1 at top-right) 
-    elif not is_white[0] and is_white[1] and not is_white[2] and is_white[3]:
-        return 2
-    
-    # Rotated 270° clockwise (A1 at bottom-right)
-    elif is_white[0] and not is_white[1] and is_white[2] and not is_white[3]:
-        return 3
-    
-    # If the pattern doesn't match exactly, use a more reliable approach with diagonal colors
-    # In a chessboard, squares on the same diagonal have the same color
-    # Check if diagonal corners match
-    diagonals_match = (is_white[0] == is_white[2]) and (is_white[1] == is_white[3])
-    
-    if diagonals_match:
-        # If bottom-right (physical H1 in standard orientation) is white
-        if is_white[2]:
-            # Check bottom-left to determine if standard or rotated 270°
-            if not is_white[3]:  # Bottom-left is black
-                return 0  # Standard orientation
-            else:  # Bottom-left is white
-                return 3  # Rotated 270°
-        else:  # Bottom-right is black
-            # Check bottom-left to determine if rotated 90° or 180°
-            if is_white[3]:  # Bottom-left is white
-                return 1  # Rotated 90°
-            else:  # Bottom-left is black
-                return 2  # Rotated 180°
-    
-    # Last resort fallback
-    print("Warning: Chess board color pattern unclear. Defaulting to standard orientation.")
-    return 0
-
-
-def label_squares(warped_img, orientation=0, font_scale=0.5, thickness=1):
-    """
-    Label all 64 squares with chess notation.
-    
-    Args:
-        warped_img: Warped chessboard image
-        orientation: Board orientation (0-3)
-        
-    Returns:
-        labeled_img: Image with chess notation labels
-    """
-    h, w = warped_img.shape[:2]
-    square_size = h // 8
-    
-    labeled_img = warped_img.copy()
-    files = "abcdefgh"
-    ranks = "12345678"
-    
-    for row in range(8):
-        for col in range(8):
-            # Determine notation based on orientation
-            if orientation == 0:  # Standard (A1 at bottom-left)
-                notation = files[col] + ranks[7-row]
-            elif orientation == 1:  # Rotated 90° clockwise (A1 at top-left)
-                notation = files[7-row] + ranks[7-col]
-            elif orientation == 2:  # Rotated 180° (A1 at top-right)
-                notation = files[7-col] + ranks[row]
-            elif orientation == 3:  # Rotated 270° clockwise (A1 at bottom-right)
-                notation = files[row] + ranks[col]
-            
-            # Calculate center of square for label placement
-            center_x = int((col + 0.5) * square_size)
-            center_y = int((row + 0.5) * square_size)
-            
-            # Determine text color (for visibility)
-            roi = labeled_img[row*square_size:(row+1)*square_size, 
-                              col*square_size:(col+1)*square_size]
-            avg_brightness = np.mean(roi)
-            text_color = (0, 0, 0) if avg_brightness > 128 else (255, 255, 255)
-            
-            # Add notation text
-            cv2.putText(labeled_img, notation, (center_x-10, center_y+5), 
-                        cv2.FONT_HERSHEY_SIMPLEX, font_scale, text_color, thickness)
-    
-    return labeled_img
-
-
-def get_square_mapping(orientation=0):
-    """
-    Create a mapping from chessboard coordinates (0-7, 0-7) to chess notation.
-    
-    Args:
-        orientation: Board orientation (0-3)
-        
-    Returns:
-        mapping: Dictionary mapping (row, col) to chess notation
-    """
-    mapping = {}
-    files = "abcdefgh"
-    ranks = "12345678"
-    
-    for row in range(8):
-        for col in range(8):
-            # Determine notation based on orientation
-            if orientation == 0:  # Standard (A1 at bottom-left)
-                notation = files[col] + ranks[7-row]
-            elif orientation == 1:  # Rotated 90° clockwise (A1 at top-left)
-                notation = files[7-row] + ranks[7-col]
-            elif orientation == 2:  # Rotated 180° (A1 at top-right)
-                notation = files[7-col] + ranks[row]
-            elif orientation == 3:  # Rotated 270° clockwise (A1 at bottom-right)
-                notation = files[row] + ranks[col]
-            
-            mapping[(row, col)] = notation
-    
-    return mapping
-
-
-def detect_piece_position(warped_img, x, y):
-    """
-    Determine chess notation for a given pixel position.
-    
-    Args:
-        warped_img: Warped chessboard image 
-        x, y: Pixel coordinates in warped image
-        
-    Returns:
-        notation: Chess notation (e.g., 'e4') for the square at (x,y)
-        coords: Row, col coordinates (0-7, 0-7) of the square
-    """
-    h, w = warped_img.shape[:2]
-    square_size = h // 8
-    
-    # Convert pixels to square coordinates
-    col = min(int(x // square_size), 7)
-    row = min(int(y // square_size), 7)
-    
-    # Get orientation from a pre-detected orientation or detect it
-    orientation = determine_orientation(warped_img)
-    
-    # Get mapping and look up notation
-    mapping = get_square_mapping(orientation)
-    notation = mapping[(row, col)]
-    
-    return notation, (row, col)
-
-
-def analyze_chess_position(warped_img, model_path, orientation=0, debug=False):
-    """
-    Analyze the chess position by identifying pieces on each square.
-    
-    Args:
-        warped_img: Warped chessboard image
-        model_path: Path to the chess piece CNN model
-        orientation: Board orientation (0-3)
-        debug: Whether to save debug images
-        
-    Returns:
-        position: Dictionary mapping square notation to piece type
-        visual: Annotated image showing pieces detected
-        fen: Forsyth-Edwards Notation of the position
-    """
-    # Load the chess piece model
-    try:
-        # First, register the custom objects that might be in the model
-        custom_objects = {
-            'TrueDivide': tf.keras.layers.Lambda(lambda x: x / 255.0)
-        }
-        
-        # Use custom object scope when loading the model
-        with tf.keras.utils.custom_object_scope(custom_objects):
-            model = tf.keras.models.load_model(model_path)
-            print(f"Successfully loaded model from {model_path}")
-    except Exception as e:
-        print(f"Error loading model: {e}")
-        print("\nAttempting alternate loading method...")
-        
-        try:
-            # Try another approach
-            model = tf.keras.models.load_model(
-                model_path, 
-                custom_objects={'TrueDivide': tf.keras.layers.Lambda(lambda x: x / 255.0)},
-                compile=False
-            )
-            print(f"Successfully loaded model using alternate method")
-        except Exception as e2:
-            print(f"Both loading methods failed: {e2}")
-            print("Continuing without piece detection")
-            return None, warped_img, None
-    
-    h, w = warped_img.shape[:2]
-    square_size = h // 8
-    
-    # Create a copy of the image for visualization
-    visual = warped_img.copy()
-    
-    # Get the square mapping based on orientation
-    square_map = get_square_mapping(orientation)
-    
-    # Create a dictionary to store the position
-    position = {}
-    
-    # Create a directory to save individual square images if debugging
-    if debug:
-        os.makedirs('squares', exist_ok=True)
-    
-    # Process each square
-    for row in range(8):
-        for col in range(8):
-            # Extract the square
-            y1, y2 = row * square_size, (row + 1) * square_size
-            x1, x2 = col * square_size, (col + 1) * square_size
-            square_img = warped_img[y1:y2, x1:x2]
-            
-            # Save the square image for debugging
-            if debug:
-                notation = square_map[(row, col)]
-                cv2.imwrite(f'squares/square_{notation}.png', square_img)
-            
-            # Preprocess for the model
-            # Resize to expected input size of MobileNetV2 (100x100 based on your training script)
-            processed_img = cv2.resize(square_img, (100, 100))
-            
-            # Handle grayscale images (convert to RGB)
-            if len(processed_img.shape) == 2:
-                processed_img = cv2.cvtColor(processed_img, cv2.COLOR_GRAY2RGB)
-            elif processed_img.shape[2] == 1:
-                processed_img = cv2.cvtColor(processed_img, cv2.COLOR_GRAY2RGB)
-            
-            # Add batch dimension
-            processed_img = np.expand_dims(processed_img, axis=0)
-            
-            # Predict the piece
+        if unfreeze_base:
+            # Optionally unfreeze some layers for fine-tuning
             try:
-                prediction = model.predict(processed_img, verbose=0)
-                piece_type = decode_prediction(prediction)
-            except Exception as e:
-                print(f"Error predicting square at {row}, {col}: {e}")
-                piece_type = 'error'
-            
-            # Get square notation
-            notation = square_map[(row, col)]
-            
-            # Store the result
-            position[notation] = piece_type
-            
-            # Annotate the visual with piece type
-            if piece_type not in ['empty', 'error']:
-                center_x = int((col + 0.5) * square_size)
-                center_y = int((row + 0.5) * square_size)
+                # Find the base model - name might vary
+                base_model = None
+                for layer in model.layers:
+                    if 'mobilenetv2' in layer.name.lower():
+                        base_model = layer
+                        break
                 
-                # Choose text color for visibility
-                avg_brightness = np.mean(square_img)
-                text_color = (0, 0, 0) if avg_brightness > 128 else (255, 255, 255)
-                
-                # Use a shorter piece notation for visual clarity
-                short_notation = get_short_piece_notation(piece_type)
-                cv2.putText(visual, short_notation, (center_x-10, center_y+5), 
-                            cv2.FONT_HERSHEY_SIMPLEX, 0.7, text_color, 2)
-    
-    # Generate FEN representation
-    fen = position_to_fen(position, orientation)
-    
-    return position, visual, fen
-
-
-def decode_prediction(prediction):
-    """
-    Convert model prediction to a piece type string.
-    Adapted for the model's output format which uses p_w (pawn white), p_b (pawn black), etc.
-    """
-    # Print prediction shape and values for debugging
-    if debug:
-        print(f"Prediction shape: {prediction.shape}")
-        print(f"Prediction values: {prediction[0]}")
-    
-    # If model outputs probabilities for each class
-    if isinstance(prediction, np.ndarray):
-        if prediction.ndim == 2:  # Batch of predictions (most common case)
-            class_idx = np.argmax(prediction[0])
-        else:  # Single array of probabilities
-            class_idx = np.argmax(prediction)
-        
-        # Get class names based on your data directory from the training script
-        # The order is determined by alphabetical sorting of folder names
-        # This assumes your data folders were named: empty, p_b, p_w, etc.
-        
-        # Since we don't know the exact order, let's look at the class index and probability
-        # to provide some debugging information
-        confidence = prediction[0][class_idx] if prediction.ndim == 2 else prediction[class_idx]
-        print(f"Predicted class index: {class_idx}, confidence: {confidence:.2f}")
-        
-        # This is a guess at the class order based on typical alphabetical sorting
-        # You may need to adjust this based on your actual folder structure
-        # In most deep learning libraries, the folders are sorted alphabetically
-        class_names = [
-            'b_b', 'b_w', 'empty', 
-            'k_b', 'k_w', 'n_b', 'n_w',
-            'p_b', 'p_w', 'q_b', 'q_w',
-            'r_b', 'r_w'
-        ]
-        
-        # Make sure class_idx is within range of class_names
-        if class_idx < len(class_names):
-            return class_names[class_idx]
-        else:
-            print(f"Warning: Class index {class_idx} is out of range for class_names")
-            return "unknown"
-    
-    # For other output formats, add appropriate handling
-    return "unknown"
-
-
-def get_short_piece_notation(piece_type):
-    """Convert p_w/p_b style piece type to short notation for visualization."""
-    # Map piece types to short notations for display
-    piece_map = {
-        'p_w': 'wP', 'n_w': 'wN', 'b_w': 'wB', 'r_w': 'wR', 'q_w': 'wQ', 'k_w': 'wK',
-        'p_b': 'bP', 'n_b': 'bN', 'b_b': 'bB', 'r_b': 'bR', 'q_b': 'bQ', 'k_b': 'bK',
-        'empty': '',
-    }
-    
-    return piece_map.get(piece_type, piece_type)
-
-
-def position_to_fen(position, orientation=0):
-    """
-    Convert position dictionary to FEN (Forsyth-Edwards Notation).
-    Adapted for p_w/p_b style piece naming.
-    """
-    # Map piece types to FEN characters
-    fen_map = {
-        'p_w': 'P', 'n_w': 'N', 'b_w': 'B', 'r_w': 'R', 'q_w': 'Q', 'k_w': 'K',
-        'p_b': 'p', 'n_b': 'n', 'b_b': 'b', 'r_b': 'r', 'q_b': 'q', 'k_b': 'k',
-        'empty': '1', 'error': '1', 'unknown': '1'
-    }
-    
-    # Generate a board representation
-    board = []
-    for rank in range(8, 0, -1):  # FEN starts at rank 8
-        rank_str = ''
-        empty_count = 0
-        
-        for file in 'abcdefgh':
-            square = file + str(rank)
-            piece = position.get(square, 'empty')
-            
-            if piece in ['empty', 'error', 'unknown']:
-                empty_count += 1
-            else:
-                if empty_count > 0:
-                    rank_str += str(empty_count)
-                    empty_count = 0
-                rank_str += fen_map.get(piece, '1')
-        
-        if empty_count > 0:
-            rank_str += str(empty_count)
-            
-        board.append(rank_str)
-    
-    # Join ranks with slashes
-    fen = '/'.join(board)
-    
-    # Add other FEN components (to make it a valid FEN)
-    # For now, just assume it's white to move, both sides can castle, no en passant, etc.
-    fen += " w KQkq - 0 1"
-    
-    return fen
-
-
-def main():
-    parser = argparse.ArgumentParser(
-        description="Detect a chessboard, determine orientation, label squares, and identify pieces."
-    )
-    parser.add_argument('image', help='Path to input image')
-    parser.add_argument('--model', default='chess_piece_model.h5',
-                        help='Path to chess piece CNN model')
-    parser.add_argument('--clusters', type=int, default=4,
-                        help='Number of color clusters for k-means')
-    parser.add_argument('--downscale', type=int, default=800,
-                        help='Max dimension for faster processing')
-    parser.add_argument('--debug', action='store_true',
-                        help='Show intermediate masks and figures')
-    args = parser.parse_args()
-
-    # Set debug flag
-    global debug
-    debug = args.debug
-
-    # Load and optionally downscale
-    img = cv2.imread(args.image)
-    if img is None:
-        print(f"Failed to load image {args.image}")
-        return
-    h, w = img.shape[:2]
-    scale = args.downscale / max(h, w)
-    if scale < 1.0:
-        img = cv2.resize(img, None, fx=scale, fy=scale,
-                         interpolation=cv2.INTER_AREA)
-
-    # 1) detect the board corners
-    pts = extract_board_region(img, k=args.clusters, debug=args.debug)
-    if pts is None:
-        print("Failed to find board region via color clustering.")
-        return
-
-    # 2) warp the board to a square and draw grid
-    overlay, warped, transform_matrix = warp_and_draw(img, pts)
-    
-    # 3) determine board orientation
-    orientation = determine_orientation(warped, debug=args.debug)
-    orientation_names = ["Standard", "Rotated 90°", "Rotated 180°", "Rotated 270°"]
-    print(f"Detected orientation: {orientation_names[orientation]}")
-    
-    # 4) label squares with chess notation
-    labeled_warped = label_squares(warped, orientation)
-    
-    # 5) identify pieces on each square
-    if os.path.exists(args.model):
-        position, pieces_visual, fen = analyze_chess_position(warped, args.model, orientation, args.debug)
-        
-        if position is not None:
-            # Save results with pieces
-            cv2.imwrite('board_with_pieces.png', pieces_visual)
-            
-            # Print the detected pieces
-            print("\nDetected pieces:")
-            empty_count = 0
-            for notation, piece in sorted(position.items()):
-                if piece not in ['empty', 'error', 'unknown']:
-                    print(f"{notation}: {piece}")
+                if base_model:
+                    # Unfreeze the top layers
+                    for layer in base_model.layers[-20:]:
+                        layer.trainable = True
+                    print("Unfroze top 20 layers of base model for fine-tuning")
                 else:
-                    empty_count += 1
-            print(f"Empty squares: {empty_count}")
-            
-            # Print FEN
-            print(f"\nFEN notation: {fen}")
+                    print("Could not identify base model layer for unfreezing")
+            except Exception as e:
+                print(f"Error unfreezing base model layers: {e}")
+        
+        # Train with all training data
+        history = model.fit(
+            train_generator,
+            steps_per_epoch=steps_per_epoch,
+            epochs=epochs,
+            validation_data=validation_generator,
+            validation_steps=validation_steps,
+            callbacks=callbacks,
+            verbose=1,
+            initial_epoch=initial_epoch
+        )
+        
+        # Plot training history
+        plot_history(history, f"continued_from_epoch_{initial_epoch}")
+        
     else:
-        print(f"Model file {args.model} not found. Skipping piece detection.")
+        # New training with two phases
+        print("\nPhase 1: Training with frozen base model...")
+        history1 = model.fit(
+            train_generator,
+            steps_per_epoch=steps_per_epoch,
+            epochs=20,
+            validation_data=validation_generator,
+            validation_steps=validation_steps,
+            callbacks=callbacks,
+            verbose=1
+        )
+        
+        if unfreeze_base:
+            # Fine-tune by unfreezing some layers
+            print("\nPhase 2: Fine-tuning with unfrozen top layers...")
+            
+            # Unfreeze the top layers of the base model
+            try:
+                base_model = model.get_layer('mobilenetv2_1.00_100')
+                # Unfreeze the last 20 layers
+                for layer in base_model.layers[-20:]:
+                    layer.trainable = True
+            except:
+                # Try with different layer name pattern
+                for layer in model.layers:
+                    if 'mobilenetv2' in layer.name.lower():
+                        base_model = layer
+                        for sublayer in base_model.layers[-20:]:
+                            sublayer.trainable = True
+                        break
+            
+            # Re-compile the model with a lower learning rate
+            model.compile(
+                optimizer=tf.keras.optimizers.Adam(learning_rate=1e-5),
+                loss='categorical_crossentropy',
+                metrics=['accuracy']
+            )
+            
+            # Continue training with unfrozen layers
+            history2 = model.fit(
+                train_generator,
+                steps_per_epoch=steps_per_epoch,
+                epochs=epochs,  # Continue for all epochs
+                validation_data=validation_generator,
+                validation_steps=validation_steps,
+                callbacks=callbacks,
+                verbose=1,
+                initial_epoch=20  # Start from epoch 20
+            )
+            
+            # Plot combined training history
+            plot_combined_history(history1, history2)
+        else:
+            # Plot just the first phase history
+            plot_history(history1, "phase1_only")
     
-    # Save results
-    cv2.imwrite('board_grid.png', overlay)
-    cv2.imwrite('board_warped.png', warped)
-    cv2.imwrite('board_labeled.png', labeled_warped)
+    # Load the best model
+    best_model = tf.keras.models.load_model(
+        output_model_path,
+        custom_objects={'Normalizer': Normalizer}
+    )
     
-    # Create mapping 
-    square_map = get_square_mapping(orientation)
-    print("\nSquare mapping (row, col) -> notation:")
-    for row in range(8):
-        for col in range(8):
-            print(f"({row}, {col}) -> {square_map[(row, col)]}", end="\t")
-        print()
+    # Evaluate the best model
+    print("\nEvaluating best model on validation data...")
+    val_loss, val_accuracy = best_model.evaluate(validation_generator, steps=validation_steps)
+    print(f"Validation Loss: {val_loss:.4f}")
+    print(f"Validation Accuracy: {val_accuracy:.4f}")
     
-    print('\nSaved board_grid.png, board_warped.png, board_labeled.png')
-    if os.path.exists(args.model) and position is not None:
-        print('and board_with_pieces.png')
+    print(f"\nTraining complete! Model saved to {output_model_path}")
     
-    # Simple test - detect a position from pixel
-    test_x, test_y = warped.shape[1] // 2, warped.shape[0] // 2  # center of image
-    notation, coords = detect_piece_position(warped, test_x, test_y)
-    print(f"\nCenter square is at {test_x}, {test_y} -> {notation} (coordinates: {coords})")
+    return best_model, class_names
 
+def plot_history(history, title_suffix=""):
+    """Plot the training history from a single training session."""
+    plt.figure(figsize=(12, 5))
+    
+    # Plot accuracy
+    plt.subplot(1, 2, 1)
+    plt.plot(history.history['accuracy'], label='Train')
+    plt.plot(history.history['val_accuracy'], label='Validation')
+    plt.title(f'Model Accuracy {title_suffix}')
+    plt.ylabel('Accuracy')
+    plt.xlabel('Epoch')
+    plt.legend()
+    
+    # Plot loss
+    plt.subplot(1, 2, 2)
+    plt.plot(history.history['loss'], label='Train')
+    plt.plot(history.history['val_loss'], label='Validation')
+    plt.title(f'Model Loss {title_suffix}')
+    plt.ylabel('Loss')
+    plt.xlabel('Epoch')
+    plt.legend()
+    
+    plt.tight_layout()
+    plt.savefig(f'training_history_{title_suffix}.png')
+    plt.close()
 
-# Global debug variable
-debug = False
+def plot_combined_history(history1, history2):
+    """Plot combined training history from two phases."""
+    plt.figure(figsize=(12, 5))
+    
+    # Plot accuracy
+    plt.subplot(1, 2, 1)
+    plt.plot(history1.history['accuracy'], label='Phase 1 Train')
+    plt.plot(history1.history['val_accuracy'], label='Phase 1 Validation')
+    
+    # Append Phase 2 histories
+    phase1_epochs = len(history1.history['accuracy'])
+    plt.plot(range(phase1_epochs, phase1_epochs + len(history2.history['accuracy'])), 
+             history2.history['accuracy'], label='Phase 2 Train')
+    plt.plot(range(phase1_epochs, phase1_epochs + len(history2.history['val_accuracy'])), 
+             history2.history['val_accuracy'], label='Phase 2 Validation')
+    
+    plt.title('Model Accuracy')
+    plt.ylabel('Accuracy')
+    plt.xlabel('Epoch')
+    plt.legend()
+    
+    # Plot loss
+    plt.subplot(1, 2, 2)
+    plt.plot(history1.history['loss'], label='Phase 1 Train')
+    plt.plot(history1.history['val_loss'], label='Phase 1 Validation')
+    
+    # Append Phase 2 histories
+    plt.plot(range(phase1_epochs, phase1_epochs + len(history2.history['loss'])), 
+             history2.history['loss'], label='Phase 2 Train')
+    plt.plot(range(phase1_epochs, phase1_epochs + len(history2.history['val_loss'])), 
+             history2.history['val_loss'], label='Phase 2 Validation')
+    
+    plt.title('Model Loss')
+    plt.ylabel('Loss')
+    plt.xlabel('Epoch')
+    plt.legend()
+    
+    plt.tight_layout()
+    plt.savefig('training_history_combined.png')
+    plt.close()
 
-
-if __name__ == '__main__':
-    main()
+if __name__ == "__main__":
+    import argparse
+    
+    parser = argparse.ArgumentParser(description="Train a chess piece recognition model")
+    parser.add_argument("--data_dir", type=str, required=True, 
+                        help="Directory containing the generated chess piece images (with class subdirectories)")
+    parser.add_argument("--output_model", type=str, default="chess_piece_model_new.keras",
+                        help="Path to save the trained model")
+    parser.add_argument("--existing_model", type=str, default=None,
+                        help="Path to an existing model to continue training")
+    parser.add_argument("--input_size", type=int, default=100,
+                        help="Size to resize input images (default: 100)")
+    parser.add_argument("--batch_size", type=int, default=32,
+                        help="Batch size for training (default: 32)")
+    parser.add_argument("--epochs", type=int, default=50,
+                        help="Maximum number of epochs to train (default: 50)")
+    parser.add_argument("--no_unfreeze", action="store_true",
+                        help="Disable unfreezing base model layers")
+    parser.add_argument("--continue_epoch", type=int, default=0,
+                        help="Epoch to continue from when using existing model")
+    
+    args = parser.parse_args()
+    
+    # Train the model
+    train_chess_piece_model(
+        args.data_dir,
+        args.output_model,
+        existing_model_path=args.existing_model,
+        input_size=(args.input_size, args.input_size),
+        batch_size=args.batch_size,
+        epochs=args.epochs,
+        unfreeze_base=not args.no_unfreeze,
+        continue_epoch=args.continue_epoch
+    )
