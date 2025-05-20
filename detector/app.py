@@ -5,15 +5,28 @@ This script detects a chess board in an image, determines its orientation,
 labels all squares with proper chess notation (a1-h8), and identifies chess pieces
 using a CNN model.
 
+It can also process a directory of video frames, extract FEN positions from each frame,
+and combine transcript segments with the same FEN position into a JSON file.
+
 Steps:
 1. Detect the board using color segmentation
 2. Determine orientation by analyzing corner square colors
 3. Label all 64 squares with proper chess notation
 4. Identify the chess pieces on each square using a CNN model
 5. Output annotated images showing the detected board and pieces
+6. (Optional) Process a directory of video frames and extract FEN positions
+7. (Optional) Combine transcript segments with the same FEN position
+8. (Optional) Output the result in JSON format
 
 Usage:
+    # Process a single image
     python chess_board_detector.py path/to/image.png --model chess_piece_model.h5 --clusters 4 --downscale 800 --debug
+
+    # Process a single video directory
+    python chess_board_detector.py --process-video --video-dir path/to/video/imgs --srt-file path/to/transcript.srt --model chess_piece_model.h5 --output output.json
+
+    # Process all videos in a parent directory
+    python chess_board_detector.py --process-video --parent-dir path/to/videos --model chess_piece_model.h5
 """
 import cv2
 import numpy as np
@@ -22,6 +35,7 @@ from itertools import combinations
 import tensorflow as tf
 import os
 import json
+import re
 
 class Normalizer(tf.keras.layers.Layer):
     def call(self, inputs):
@@ -85,7 +99,7 @@ def extract_board_region(img, k=4, sample_size=10000, debug=False):
 
         # fit rotated rect and compute how far its aspect‐ratio deviates from 1.0
         rect = cv2.minAreaRect(cnt)
-        (cx,cy),(bw,bh),angle = rect
+        _,(bw,bh),_ = rect  # Unpack but ignore center and angle
         aspect = max(bw,bh)/min(bw,bh)
         score = abs(1.0 - aspect)
 
@@ -264,7 +278,7 @@ def label_squares(warped_img, orientation=0, font_scale=0.5, thickness=1):
     Returns:
         labeled_img: Image with chess notation labels
     """
-    h, w = warped_img.shape[:2]
+    h, _ = warped_img.shape[:2]  # Only need height
     square_size = h // 8
 
     labeled_img = warped_img.copy()
@@ -343,7 +357,7 @@ def detect_piece_position(warped_img, x, y):
         notation: Chess notation (e.g., 'e4') for the square at (x,y)
         coords: Row, col coordinates (0-7, 0-7) of the square
     """
-    h, w = warped_img.shape[:2]
+    h, _ = warped_img.shape[:2]  # Only need height
     square_size = h // 8
 
     # Convert pixels to square coordinates
@@ -385,11 +399,11 @@ def analyze_chess_position(warped_img, model_path, orientation=0, debug=False):
     print(f"meta_path", meta_path)
     with open(meta_path, "r") as f:
         meta = json.load(f)
-    class_names = [meta["class_mapping"][str(i)] 
+    class_names = [meta["class_mapping"][str(i)]
                    for i in range(len(meta["class_mapping"]))]
 
     # 3) prep sizes & containers
-    h, w = warped_img.shape[:2]
+    h, _ = warped_img.shape[:2]  # Only need height
     sz = h // 8
     visual = warped_img.copy()
     square_map = get_square_mapping(orientation)
@@ -456,14 +470,14 @@ def decode_prediction(prediction):
             'p_b', 'p_w', 'q_b', 'q_w',
             'r_b', 'r_w', 'unknown'  # The 14th class
         ]
-        
+
         # Make sure class_idx is within range of class_names
         if class_idx < len(class_names):
             return class_names[class_idx]
         else:
             print(f"Warning: Class index {class_idx} is out of range for class_names")
             return "unknown"
-    
+
     # For other output formats, add appropriate handling
     return "unknown"
 
@@ -476,11 +490,11 @@ def get_short_piece_notation(piece_type):
         'p_b': 'bP', 'n_b': 'bN', 'b_b': 'bB', 'r_b': 'bR', 'q_b': 'bQ', 'k_b': 'bK',
         'empty': '', 'empty_dot': '',
     }
-    
+
     return piece_map.get(piece_type, piece_type)
 
 
-def position_to_fen(position, orientation=0):
+def position_to_fen(position, orientation=0):  # orientation parameter kept for API compatibility
     """
     Convert position dictionary to FEN (Forsyth-Edwards Notation).
     Adapted for p_w/p_b style piece naming.
@@ -491,17 +505,17 @@ def position_to_fen(position, orientation=0):
         'p_b': 'p', 'n_b': 'n', 'b_b': 'b', 'r_b': 'r', 'q_b': 'q', 'k_b': 'k',
         'empty': '1', 'error': '1', 'unknown': '1', 'empty_dot': '1'
     }
-    
+
     # Generate a board representation
     board = []
     for rank in range(8, 0, -1):  # FEN starts at rank 8
         rank_str = ''
         empty_count = 0
-        
+
         for file in 'abcdefgh':
             square = file + str(rank)
             piece = position.get(square, 'empty')
-            
+
             if piece in ['empty', 'error', 'unknown']:
                 empty_count += 1
             else:
@@ -509,27 +523,265 @@ def position_to_fen(position, orientation=0):
                     rank_str += str(empty_count)
                     empty_count = 0
                 rank_str += fen_map.get(piece, '1')
-        
+
         if empty_count > 0:
             rank_str += str(empty_count)
-            
+
         board.append(rank_str)
-    
+
     # Join ranks with slashes
     fen = '/'.join(board)
-    
+
     # Add other FEN components (to make it a valid FEN)
     # For now, just assume it's white to move, both sides can castle, no en passant, etc.
     fen += " w KQkq - 0 1"
-    
+
     return fen
+
+
+def parse_srt_file(srt_path):
+    """
+    Parse an SRT file and extract timestamps and text.
+
+    Args:
+        srt_path: Path to the SRT file
+
+    Returns:
+        List of dictionaries with 'start_time', 'end_time', and 'text' keys
+    """
+    with open(srt_path, 'r', encoding='utf-8') as f:
+        content = f.read().strip()
+
+    # Split the content into blocks
+    blocks = re.split(r"\n\s*\n", content)
+    transcripts = []
+
+    for block in blocks:
+        lines = block.strip().split('\n')
+        if len(lines) < 3:
+            continue
+
+        # Extract timestamp line
+        timestamp_line = lines[1]
+        timestamps = re.match(r"(\d{2}:\d{2}:\d{2},\d{3}) --> (\d{2}:\d{2}:\d{2},\d{3})", timestamp_line)
+        if not timestamps:
+            continue
+
+        start_time = timestamps.group(1)
+        end_time = timestamps.group(2)
+
+        # Extract text (could be multiple lines)
+        text = ' '.join(lines[2:])
+
+        # Convert timestamp to a format matching the image filenames
+        start_time_for_img = start_time.replace(':', '-').replace(',', '.')
+
+        transcripts.append({
+            'start_time': start_time,
+            'end_time': end_time,
+            'start_time_for_img': start_time_for_img,
+            'text': text
+        })
+
+    return transcripts
+
+
+def process_frames_directory(frames_dir, model_path, debug=False):
+    """
+    Process all frames in a directory and extract FEN positions.
+
+    Args:
+        frames_dir: Directory containing the frames
+        model_path: Path to the chess piece CNN model
+        debug: Whether to output debug information
+
+    Returns:
+        Dictionary mapping frame filenames to FEN positions
+    """
+    # Load the model (we don't need to store it as we pass model_path directly to analyze_chess_position)
+    custom_objects = {
+        'Normalizer': Normalizer,
+        'preprocess_input': _PREPROCESS_FN
+    }
+    tf.keras.models.load_model(
+        model_path,
+        custom_objects=custom_objects,
+        compile=False
+    )
+
+    # Get all image files in the directory
+    image_files = [f for f in os.listdir(frames_dir) if f.lower().endswith(('.png', '.jpg', '.jpeg'))]
+    if not image_files:
+        print(f"No image files found in {frames_dir}")
+        return {}
+
+    # Process each image
+    fen_positions = {}
+    for img_file in sorted(image_files):
+        img_path = os.path.join(frames_dir, img_file)
+        print(f"Processing {img_path}...")
+
+        # Load and process the image
+        img = cv2.imread(img_path)
+        if img is None:
+            print(f"Failed to load image {img_path}")
+            continue
+
+        # Downscale for faster processing
+        h, w = img.shape[:2]
+        scale = 800 / max(h, w)
+        if scale < 1.0:
+            img = cv2.resize(img, None, fx=scale, fy=scale, interpolation=cv2.INTER_AREA)
+
+        # Detect the board corners
+        pts = extract_board_region(img, k=4, debug=debug)
+        if pts is None:
+            print(f"Failed to find board region in {img_path}")
+            continue
+
+        # Warp the board to a square
+        _, warped, _ = warp_and_draw(img, pts)  # Ignore overlay and transform_matrix
+
+        # Determine board orientation
+        orientation = determine_orientation(warped, debug=debug)
+
+        # Identify pieces and get FEN
+        try:
+            _, _, fen = analyze_chess_position(warped, model_path, orientation, debug)  # Ignore position and visual
+            fen_positions[img_file] = fen
+            print(f"FEN for {img_file}: {fen}")
+        except Exception as e:
+            print(f"Error processing {img_path}: {e}")
+
+    return fen_positions
+
+
+def ensure_proper_spacing(text1, text2):
+    """
+    Ensure proper spacing when combining two text segments.
+
+    Args:
+        text1: First text segment
+        text2: Second text segment
+
+    Returns:
+        Combined text with proper spacing
+    """
+    # Check if text1 ends with a space
+    if not text1.endswith(' '):
+        text1 += ' '
+
+    # Check if text2 starts with a space
+    if text2.startswith(' '):
+        text2 = text2[1:]
+
+    return text1 + text2
+
+
+def combine_transcripts_by_fen(transcripts, fen_positions):
+    """
+    Combine transcript segments with the same FEN position.
+
+    Args:
+        transcripts: List of transcript dictionaries
+        fen_positions: Dictionary mapping frame filenames to FEN positions
+
+    Returns:
+        List of dictionaries with 'fen' and 'description' keys
+    """
+    # Group transcripts by FEN position
+    fen_to_transcripts = {}
+
+    for transcript in transcripts:
+        img_file = transcript['start_time_for_img'] + '.png'
+        if img_file not in fen_positions:
+            print(f"Warning: No FEN position found for {img_file}")
+            continue
+
+        fen = fen_positions[img_file]
+        if fen not in fen_to_transcripts:
+            fen_to_transcripts[fen] = []
+
+        fen_to_transcripts[fen].append(transcript)
+
+    # Combine transcripts with the same FEN
+    combined_data = []
+    for fen, fen_transcripts in fen_to_transcripts.items():
+        # Sort transcripts by start time
+        fen_transcripts.sort(key=lambda x: x['start_time'])
+
+        # Combine text
+        combined_text = fen_transcripts[0]['text']
+        for i in range(1, len(fen_transcripts)):
+            combined_text = ensure_proper_spacing(combined_text, fen_transcripts[i]['text'])
+
+        combined_data.append({
+            'fen': fen,
+            'description': combined_text
+        })
+
+    return combined_data
+
+
+def save_to_json(combined_data, output_path):
+    """
+    Save the combined data to a JSON file.
+
+    Args:
+        combined_data: List of dictionaries with 'fen' and 'description' keys
+        output_path: Path to save the JSON file
+
+    Returns:
+        Path to the saved JSON file
+    """
+    with open(output_path, 'w', encoding='utf-8') as f:
+        json.dump(combined_data, f, indent=4)
+
+    print(f"Saved combined data to {output_path}")
+    return output_path
+
+
+def find_video_directories(parent_dir):
+    """
+    Find all video directories with their corresponding SRT files and image directories.
+
+    Args:
+        parent_dir: Parent directory containing video folders
+
+    Returns:
+        List of dictionaries with 'video_dir', 'srt_file', and 'imgs_dir' keys
+    """
+    video_dirs = []
+
+    # Walk through the parent directory
+    for root, _, files in os.walk(parent_dir):  # Ignore dirs
+        # Look for SRT files
+        srt_files = [f for f in files if f.lower().endswith('.srt')]
+
+        # If there are SRT files in this directory
+        for srt_file in srt_files:
+            srt_path = os.path.join(root, srt_file)
+
+            # Check if there's an 'imgs' directory
+            imgs_dir = os.path.join(root, 'imgs')
+            if os.path.isdir(imgs_dir):
+                # Check if the imgs directory has image files
+                img_files = [f for f in os.listdir(imgs_dir) if f.lower().endswith(('.png', '.jpg', '.jpeg'))]
+                if img_files:
+                    video_dirs.append({
+                        'video_dir': root,
+                        'srt_file': srt_path,
+                        'imgs_dir': imgs_dir
+                    })
+
+    return video_dirs
 
 
 def main():
     parser = argparse.ArgumentParser(
         description="Detect a chessboard, determine orientation, label squares, and identify pieces."
     )
-    parser.add_argument('image', help='Path to input image')
+    parser.add_argument('image', nargs='?', help='Path to input image')
     parser.add_argument('--model', default='chess_piece_model.h5',
                         help='Path to chess piece CNN model')
     parser.add_argument('--clusters', type=int, default=4,
@@ -538,7 +790,132 @@ def main():
                         help='Max dimension for faster processing')
     parser.add_argument('--debug', action='store_true',
                         help='Show intermediate masks and figures')
+
+    # Add new arguments for video processing
+    parser.add_argument('--process-video', action='store_true',
+                        help='Process a directory of video frames and combine transcript segments')
+    parser.add_argument('--video-dir', help='Directory containing video frames')
+    parser.add_argument('--srt-file', help='Path to the SRT transcript file')
+    parser.add_argument('--output', help='Path to save the output JSON file')
+    parser.add_argument('--parent-dir', help='Parent directory containing multiple video folders to process')
+
     args = parser.parse_args()
+
+    # Check if we're processing videos
+    if args.process_video:
+        # Check if model exists
+        if not os.path.exists(args.model):
+            print(f"Error: Model file {args.model} does not exist")
+            return
+
+        # Check if we're processing a parent directory or a single video
+        if args.parent_dir:
+            if not os.path.exists(args.parent_dir):
+                print(f"Error: Parent directory {args.parent_dir} does not exist")
+                return
+
+            # Find all video directories with SRT files and image directories
+            print(f"Searching for videos in {args.parent_dir}...")
+            video_dirs = find_video_directories(args.parent_dir)
+
+            if not video_dirs:
+                print(f"No video directories with SRT files and image directories found in {args.parent_dir}")
+                return
+
+            print(f"Found {len(video_dirs)} video directories to process")
+
+            # Process each video directory
+            for video_info in video_dirs:
+                video_dir = video_info['video_dir']
+                srt_file = video_info['srt_file']
+                imgs_dir = video_info['imgs_dir']
+
+                # Set default output path
+                video_dir_name = os.path.basename(os.path.normpath(video_dir))
+                output_path = os.path.join(video_dir, f"{video_dir_name}_output.json")
+
+                print(f"\nProcessing video: {video_dir_name}")
+                print(f"  Images directory: {imgs_dir}")
+                print(f"  SRT file: {srt_file}")
+
+                # Process the video frames
+                print(f"  Processing video frames...")
+                fen_positions = process_frames_directory(imgs_dir, args.model, args.debug)
+
+                if not fen_positions:
+                    print(f"  No FEN positions extracted for {video_dir_name}. Skipping.")
+                    continue
+
+                # Parse the SRT file
+                print(f"  Parsing SRT file...")
+                transcripts = parse_srt_file(srt_file)
+
+                if not transcripts:
+                    print(f"  No transcript segments extracted for {video_dir_name}. Skipping.")
+                    continue
+
+                # Combine transcripts by FEN position
+                print(f"  Combining transcript segments by FEN position...")
+                combined_data = combine_transcripts_by_fen(transcripts, fen_positions)
+
+                # Save to JSON
+                save_to_json(combined_data, output_path)
+
+                print(f"  Processing complete for {video_dir_name}. Output saved to {output_path}")
+
+            print("\nAll videos processed successfully!")
+            return
+
+        # Process a single video directory
+        elif args.video_dir and args.srt_file:
+            if not os.path.exists(args.video_dir):
+                print(f"Error: Video directory {args.video_dir} does not exist")
+                return
+
+            if not os.path.exists(args.srt_file):
+                print(f"Error: SRT file {args.srt_file} does not exist")
+                return
+
+            # Set default output path if not provided
+            output_path = args.output
+            if not output_path:
+                video_dir_name = os.path.basename(os.path.normpath(args.video_dir))
+                output_path = os.path.join(os.path.dirname(args.video_dir), f"{video_dir_name}_output.json")
+
+            # Process the video frames
+            print(f"Processing video frames in {args.video_dir}...")
+            fen_positions = process_frames_directory(args.video_dir, args.model, args.debug)
+
+            if not fen_positions:
+                print("No FEN positions extracted. Exiting.")
+                return
+
+            # Parse the SRT file
+            print(f"Parsing SRT file {args.srt_file}...")
+            transcripts = parse_srt_file(args.srt_file)
+
+            if not transcripts:
+                print("No transcript segments extracted. Exiting.")
+                return
+
+            # Combine transcripts by FEN position
+            print("Combining transcript segments by FEN position...")
+            combined_data = combine_transcripts_by_fen(transcripts, fen_positions)
+
+            # Save to JSON
+            save_to_json(combined_data, output_path)
+
+            print(f"Processing complete. Output saved to {output_path}")
+            return
+
+        else:
+            print("Error: Either --parent-dir or both --video-dir and --srt-file are required when using --process-video")
+            return
+
+    # Original functionality for processing a single image
+    if not args.image:
+        print("Error: image path is required when not using --process-video")
+        return
 
     # Load and optionally downscale
     img = cv2.imread(args.image)
@@ -558,7 +935,7 @@ def main():
         return
 
     # 2) warp the board to a square and draw grid
-    overlay, warped, transform_matrix = warp_and_draw(img, pts)
+    overlay, warped, _ = warp_and_draw(img, pts)  # Ignore transform_matrix
 
     # 3) determine board orientation
     orientation = determine_orientation(warped, debug=args.debug)
