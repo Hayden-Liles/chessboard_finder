@@ -31,6 +31,7 @@ Usage:
     # Process videos with GPU acceleration (if available)
     python chess_board_detector.py --process-video --parent-dir path/to/videos --model chess_piece_model.h5 --use-gpu --quality high
 """
+import chess.engine
 import cv2
 import numpy as np
 import argparse
@@ -44,6 +45,9 @@ import multiprocessing
 from concurrent.futures import ThreadPoolExecutor, as_completed
 import pickle
 import gc
+import chess
+import chess.engine
+
 try:
     from tqdm import tqdm
 except ImportError:
@@ -57,6 +61,7 @@ except ImportError:
 
 # Global model cache to avoid reloading models
 MODEL_CACHE = {}
+STOCKFISH_PATH = "./stockfish/stockfish-ubuntu-x86-64"
 
 # Check if GPU is available
 def is_gpu_available():
@@ -595,6 +600,74 @@ def analyze_chess_position(warped_img, model_path, orientation=0, debug=False):
     fen = position_to_fen(position, orientation)
     return position, visual, fen
 
+def open_stockfish(path=STOCKFISH_PATH, threads=1, multipv=1):
+    engine = chess.engine.SimpleEngine.popen_uci(path)
+    # Limit Stockfish to one thread (reduce parallel engines), and only ask for PV=1
+    engine.configure({
+        "Threads": threads,
+        "MultiPV": multipv,
+    })
+    return engine
+
+def analyze_with_stockfish(engine: chess.engine.SimpleEngine, fen: str, depth: int = 15) -> dict:
+    board = chess.Board(fen)
+    try:
+        info = engine.analyse(
+            board,
+            chess.engine.Limit(depth=depth),
+            multipv=1  # explicit, to avoid any Python-chess “multipv” parsing hiccups
+        )
+    except Exception as e:
+        print(f"Warning: Stockfish failed on FEN {fen[:20]}…: {e}")
+        return {
+            "fen": fen,
+            "move_num": board.fullmove_number,
+            "eval_cp": None,
+            "best_move_san": None,
+            "pv": [],
+        }
+
+    # 3) Extract eval and PV safely
+    score = info.get("score")
+    eval_cp = None
+    if score is not None:
+        score = score.pov(board.turn)
+        eval_cp = score.score(mate_score=100000)
+
+    pv_moves = info.get("pv") or []
+    best_move = pv_moves[0] if pv_moves else None
+    if best_move:
+        try:
+            best_move_san = board.san(best_move)
+        except Exception:
+            best_move_san = best_move.uci()
+    else:
+        best_move_san = None
+
+    # 4) Convert the full PV to SAN
+    pv_san = []
+    tmp = board.copy()
+    for mv in pv_moves:
+        try:
+            if isinstance(mv, chess.Move):
+                move = mv
+            else:
+                move = tmp.parse_uci(mv)
+            san = tmp.san(move)
+            pv_san.append(san)
+            tmp.push(move)
+        except Exception as e:
+            # once something’s off, stop converting further
+            break
+
+    return {
+        "fen": fen,
+        "move_num": board.fullmove_number,
+        "eval_cp": eval_cp,
+        "best_move_san": best_move_san,
+        "pv": pv_san,
+    }
+
 def decode_prediction(prediction):
     """
     Convert model prediction to a piece type string.
@@ -729,6 +802,55 @@ def parse_srt_file(srt_path):
         })
 
     return transcripts
+
+def process_game(video_info: dict, model_path: str) -> dict:
+    """
+    Process a single game/video: extract FENs with commentary, analyze them with Stockfish,
+    and write the combined JSON output to disk.
+
+    Args:
+        video_info: metadata dict with at least 'game_id'.
+        model_path: path to your frame+OCR model to generate 'combined'.
+
+    Returns:
+        The JSON-able result dict.
+    """
+    # 1) Generate 'combined' list of {"fen": ..., "description": ...}
+    combined = combine_transcripts_by_fen(video_info, model_path)
+
+    # 2) Build full transcript
+    full_transcript = " ".join(item["description"] for item in combined)
+
+    # 3) Open Stockfish once
+    engine = open_stockfish()
+    analysis_points = []
+
+    # 4) Analyze each position
+    for item in combined:
+        fen = item["fen"]
+        commentary = item["description"]
+        analysis = analyze_with_stockfish(engine, fen)
+        analysis["local_commentary_window"] = commentary
+        analysis_points.append(analysis)
+
+    # 5) Clean up
+    engine.quit()
+
+    # 6) Assemble output
+    output = {
+        "game_id": video_info["game_id"],
+        "pgn": video_info.get("pgn", ""),
+        "full_transcript": full_transcript,
+        "stockfish_analysis_points": analysis_points,
+    }
+
+    # 7) Write to disk
+    out_path = f"{video_info['game_id']}.json"
+    with open(out_path, "w") as f:
+        json.dump(output, f, indent=4)
+
+    print(f"Wrote analysis JSON to {out_path}")
+    return output
 
 def process_image(img_path, model_path, debug=False, orientation_hint=None, use_original_algorithm=True):
     """
@@ -1215,320 +1337,37 @@ def process_single_video(video_info, model_path, debug=False, cpu_only=True, qua
 
     return {'video_dir': video_dir, 'output_path': output_path, 'success': True}
 
-def main():
-    parser = argparse.ArgumentParser(
-        description="Detect a chessboard, determine orientation, label squares, and identify pieces."
-    )
-    parser.add_argument('image', nargs='?', help='Path to input image')
-    parser.add_argument('--model', default='chess_piece_model.h5',
-                        help='Path to chess piece CNN model')
-    parser.add_argument('--clusters', type=int, default=4,
-                        help='Number of color clusters for k-means')
-    parser.add_argument('--downscale', type=int, default=800,
-                        help='Max dimension for faster processing (0 = no downscaling)')
-    parser.add_argument('--debug', action='store_true',
-                        help='Show intermediate masks and figures')
+# Number of color clusters for k-means
+CLUSTERS = 4
+# Quality level (affects processing algorithm parameters) ['low', 'medium', 'high']
+QUALITY = 'high'
 
-    # Add arguments for video processing
-    parser.add_argument('--process-video', action='store_true',
-                        help='Process a directory of video frames and combine transcript segments')
-    parser.add_argument('--video-dir', help='Directory containing video frames')
-    parser.add_argument('--srt-file', help='Path to the SRT transcript file')
-    parser.add_argument('--output', help='Path to save the output JSON file')
-    parser.add_argument('--parent-dir', help='Parent directory containing multiple video folders to process')
-    parser.add_argument('--max-parallel', type=int,
-                        help='Maximum number of videos to process in parallel (default: number of CPU cores)')
-    parser.add_argument('--cpu-only', action='store_true',
-                        help='Force CPU-only mode for processing (avoids CUDA/GPU errors)')
-    parser.add_argument('--use-gpu', action='store_true',
-                        help='Force GPU usage if available (default: auto-detect)')
-                        
-    # Add new optimization arguments
-    parser.add_argument('--quality', choices=['low', 'medium', 'high'], default='medium',
-                        help='Quality level (affects processing algorithm parameters)')
-    parser.add_argument('--batch-size', type=int, default=64,
-                        help='Batch size for neural network inference')
-    parser.add_argument('--optimize', action='store_true',
-                        help='Use optimized algorithms for faster processing')
-    parser.add_argument('--use-original-algorithm', action='store_true', default=True,
-                        help='Use original algorithm for maximum accuracy')
-    parser.add_argument('--preserve-quality', action='store_true',
-                        help='Preserve original image quality (no downscaling)')
-    parser.add_argument('--force-reprocess', action='store_true',
-                        help='Force reprocessing of all images, ignoring cache')
-
-    args = parser.parse_args()
-    
-    # Override downscale if preserve-quality is set
-    if args.preserve_quality:
-        args.downscale = 0
-        print("Preserve quality flag set - using original image resolution")
-
-    # Check if we're processing videos
-    if args.process_video:
-        # Check if model exists
-        if not os.path.exists(args.model):
-            print(f"Error: Model file {args.model} does not exist")
-            return
-
-        # Check if we're processing a parent directory or a single video
-        if args.parent_dir:
-            if not os.path.exists(args.parent_dir):
-                print(f"Error: Parent directory {args.parent_dir} does not exist")
-                return
-
-            # Find all video directories with SRT files and image directories
-            print(f"Searching for videos in {args.parent_dir}...")
-            video_dirs = find_video_directories(args.parent_dir)
-
-            if not video_dirs:
-                print(f"No video directories with SRT files and image directories found in {args.parent_dir}")
-                return
-
-            print(f"Found {len(video_dirs)} video directories to process")
-
-            # Add option to limit the number of parallel videos
-            max_parallel_videos = min(len(video_dirs), args.max_parallel or multiprocessing.cpu_count())
-            print(f"Processing up to {max_parallel_videos} videos in parallel")
-
-            # Print GPU status
-            if USE_GPU:
-                print(f"GPU detected and available")
-            else:
-                print(f"No GPU detected, using CPU only")
-
-            # Check if user forced CPU-only mode
-            if args.cpu_only:
-                print(f"Forcing CPU-only mode as requested")
-                use_gpu = False
-            elif args.use_gpu and USE_GPU:
-                print(f"Forcing GPU usage as requested")
-                use_gpu = True
-            else:
-                use_gpu = USE_GPU
-
-            # If using GPU, process videos sequentially to avoid CUDA context issues
-            # If using CPU, process videos in parallel
-            start_time = time.time()
-            results = []
-
-            if use_gpu and not args.cpu_only:
-                print(f"Processing videos sequentially using GPU...")
-                for video_info in video_dirs:
-                    video_dir = video_info['video_dir']
-                    video_dir_name = os.path.basename(os.path.normpath(video_dir))
-
-                    try:
-                        result = process_single_video(
-                            video_info, 
-                            args.model, 
-                            args.debug, 
-                            cpu_only=False,
-                            quality=args.quality,
-                            force_reprocess=args.force_reprocess
-                        )
-                        results.append(result)
-                        if result['success']:
-                            print(f"Successfully processed: {video_dir_name}")
-                        else:
-                            print(f"Failed to process: {video_dir_name}")
-                    except Exception as e:
-                        print(f"Error processing {video_dir_name}: {e}")
-                        
-                    # Clear memory after each video
-                    clear_memory()
-            else:
-                # CPU mode - use parallel processing
-                print(f"Processing videos in parallel using CPU only...")
-                # Create progress bar for videos
-                with tqdm(total=len(video_dirs), desc="Processing videos") as pbar:
-                    # Use ThreadPoolExecutor for parallel processing
-                    with ThreadPoolExecutor(max_workers=max_parallel_videos) as executor:
-                        # Submit tasks for each video
-                        futures = {
-                            executor.submit(
-                                process_single_video, 
-                                video_info, 
-                                args.model, 
-                                args.debug, 
-                                cpu_only=True,
-                                quality=args.quality,
-                                force_reprocess=args.force_reprocess
-                            ): video_info
-                            for video_info in video_dirs
-                        }
-
-                        # Process results as they complete
-                        for future in as_completed(futures):
-                            video_info = futures[future]
-                            video_dir = video_info['video_dir']
-                            video_dir_name = os.path.basename(os.path.normpath(video_dir))
-
-                            try:
-                                result = future.result()
-                                results.append(result)
-                                if result['success']:
-                                    print(f"Successfully processed: {video_dir_name}")
-                                else:
-                                    print(f"Failed to process: {video_dir_name}")
-                            except Exception as e:
-                                print(f"Error processing {video_dir_name}: {e}")
-                            
-                            pbar.update(1)
-
-            # Print summary
-            total_time = time.time() - start_time
-            successful = sum(1 for r in results if r['success'])
-            print(f"\nProcessing complete: {successful}/{len(video_dirs)} videos processed successfully")
-            print(f"Total time: {total_time:.2f} seconds")
-            return
-
-        # Process a single video directory
-        elif args.video_dir and args.srt_file:
-            if not os.path.exists(args.video_dir):
-                print(f"Error: Video directory {args.video_dir} does not exist")
-                return
-
-            if not os.path.exists(args.srt_file):
-                print(f"Error: SRT file {args.srt_file} does not exist")
-                return
-
-            # Set default output path if not provided
-            output_path = args.output
-            if not output_path:
-                video_dir_name = os.path.basename(os.path.normpath(args.video_dir))
-                output_path = os.path.join(os.path.dirname(args.video_dir), f"{video_dir_name}_output.json")
-
-            # Print GPU status
-            if USE_GPU:
-                print(f"GPU detected and available")
-            else:
-                print(f"No GPU detected, using CPU only")
-
-            # Check if user forced CPU-only mode
-            if args.cpu_only:
-                print(f"Forcing CPU-only mode as requested")
-                use_cpu_only = True
-            elif args.use_gpu and USE_GPU:
-                print(f"Forcing GPU usage as requested")
-                use_cpu_only = False
-            else:
-                use_cpu_only = not USE_GPU
-
-            # Create a video_info dictionary for the single video
-            video_info = {
-                'video_dir': os.path.dirname(args.video_dir),
-                'srt_file': args.srt_file,
-                'imgs_dir': args.video_dir
-            }
-
-            # Process with optimized function
-            result = process_single_video(
-                video_info, 
-                args.model, 
-                args.debug, 
-                cpu_only=use_cpu_only,
-                quality=args.quality,
-                force_reprocess=args.force_reprocess
-            )
-
-            if result['success']:
-                print(f"Processing complete. Output saved to {result['output_path']}")
-            else:
-                print("Processing failed.")
-            return
-
-        else:
-            print("Error: Either --parent-dir or both --video-dir and --srt-file are required when using --process-video")
-            return
-
-    # Original functionality for processing a single image
-    if not args.image:
-        print("Error: image path is required when not using --process-video")
+def main(parent_dir, model_path):
+    video_dirs = find_video_directories(parent_dir)
+    if not video_dirs:
+        print(f"No video directories found in {parent_dir}")
         return
 
-    # Load image at original quality
-    img = cv2.imread(args.image)
-    if img is None:
-        print(f"Failed to load image {args.image}")
-        return
-    
-    # Fixed: Only downscale if the downscale parameter is positive
-    if args.downscale > 0:
-        h, w = img.shape[:2]
-        scale = args.downscale / max(h, w)
-        if scale < 1.0:
-            img = cv2.resize(img, None, fx=scale, fy=scale, 
-                             interpolation=cv2.INTER_AREA)
-            print(f"Image downscaled to max dimension {args.downscale}px")
-    else:
-        print(f"Using original image quality (no downscaling)")
+    num_workers = multiprocessing.cpu_count()
+    print(f"Processing {len(video_dirs)} videos using {num_workers} CPU cores")
 
-    # 1) detect the board corners
-    if args.optimize:
-        pts = extract_board_region_optimized(img, k=args.clusters, debug=args.debug)
-    else:
-        pts = extract_board_region(img, k=args.clusters, debug=args.debug)
-    
-    if pts is None:
-        print("Failed to find board region via color clustering.")
-        return
-
-    # 2) warp the board to a square and draw grid
-    overlay, warped, _ = warp_and_draw(img, pts)  # Ignore transform_matrix
-
-    # 3) determine board orientation
-    orientation = determine_orientation(warped, debug=args.debug)
-    orientation_names = ["Standard", "Rotated 90°", "Rotated 180°", "Rotated 270°"]
-    print(f"Detected orientation: {orientation_names[orientation]}")
-
-    # 4) label squares with chess notation
-    labeled_warped = label_squares(warped, orientation)
-
-    # 5) identify pieces on each square
-    if os.path.exists(args.model):
-        position, pieces_visual, fen = analyze_chess_position(warped, args.model, orientation, args.debug)
-
-        # Save results with pieces
-        cv2.imwrite('board_with_pieces.png', pieces_visual)
-
-        if position is not None:
-            # Print the detected pieces
-            print("\nDetected pieces:")
-            empty_count = 0
-            for notation, piece in sorted(position.items()):
-                if piece not in ['empty', 'error', 'unknown', 'empty_dot']:
-                    print(f"{notation}: {piece}")
-                else:
-                    empty_count += 1
-            print(f"Empty squares: {empty_count}")
-
-            # Print FEN
-            print(f"\nFEN notation: {fen}")
-    else:
-        print(f"Model file {args.model} not found. Skipping piece detection.")
-
-    # Save results
-    cv2.imwrite('board_grid.png', overlay)
-    cv2.imwrite('board_warped.png', warped)
-    cv2.imwrite('board_labeled.png', labeled_warped)
-
-    # Create mapping
-    square_map = get_square_mapping(orientation)
-    print("\nSquare mapping (row, col) -> notation:")
-    for row in range(8):
-        for col in range(8):
-            print(f"({row}, {col}) -> {square_map[(row, col)]}", end="\t")
-        print()
-
-    print('\nSaved board_grid.png, board_warped.png, board_labeled.png')
-    if os.path.exists(args.model):
-        print('and board_with_pieces.png')
-
-    # Simple test - detect a position from pixel
-    test_x, test_y = warped.shape[1] // 2, warped.shape[0] // 2  # center of image
-    notation, coords = detect_piece_position(warped, test_x, test_y)
-    print(f"\nCenter square is at {test_x}, {test_y} -> {notation} (coordinates: {coords})")
+    with ThreadPoolExecutor(max_workers=num_workers) as executor:
+        futures = {executor.submit(process_game, info, model_path): info for info in video_dirs}
+        for future in as_completed(futures):
+            info = futures[future]
+            game_id = os.path.basename(os.path.normpath(info['video_dir']))
+            try:
+                future.result()
+                print(f"Done: {game_id}")
+            except Exception as e:
+                print(f"Error processing {game_id}: {e}")
 
 if __name__ == '__main__':
-    main()
+    import argparse
+    parser = argparse.ArgumentParser(
+        description="Batch chess video processing with Stockfish analysis"
+    )
+    parser.add_argument('parent_dir', help='Parent directory containing video folders')
+    parser.add_argument('model', help='Path to chess piece CNN model')
+    args = parser.parse_args()
+    main(args.parent_dir, args.model)

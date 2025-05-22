@@ -1,0 +1,47 @@
+{
+
+    "game_id": "unique_identifier_for_video_or_game",
+
+    "pgn": "...",
+
+    "full_transcript": "...",
+
+    "stockfish_analysis_points": [
+
+        {
+
+            "fen": "rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w KQkq - 0 1",
+
+            "move_num": 0,
+
+            "eval_cp": 0,
+
+            "best_move_san": "e4",
+
+            "pv": ["e4", "e5", "Nf3", "Nc6", "Bb5", "a6"],
+
+            "local_commentary_window": "Okay, I guess we'll seek a 10 minute game. I really wanted to do a higher time control for with the speedrun but nobody's I want to find a game so there we go a thousand okay we're going with e4 okay e4 e5..." // Concise relevant snippets
+
+        },
+
+        {
+
+            "fen": "r1bqk1nr/pppp1ppp/2n5/2b1p3/4P3/2N2N2/PPPP1PPP/R1BQKB1R w KQkq - 0 1", // The Bc5 "inaccuracy" FEN
+
+            "move_num": 5,
+
+            "eval_cp": 50,
+
+            "best_move_san": "Nxe5",
+
+            "pv": ["Nxe5", "Nxe5", "Qh5"],
+
+            "local_commentary_window": "on ambition of bishop c5 is a well-known inaccuracy in this line who can tell me the reason why and it's very important to go for this line without fearing certain responses that i'm going to talk about after the stream and the move is thank you bismo funyuns for the prime now reasons people are afraid to take on knight takes e5" // This captures the immediate discussion around Bc5 and Nxe5.
+
+        },
+
+        // ... more key FENs with Stockfish data AND local commentary
+
+    ]
+
+} 

@@ -10,3 +10,5 @@
 *.metadata
 */videos/*
 hugging_face_upload.py
+*/stockfish
+*.pkl
