@@ -427,15 +427,22 @@ def get_short_piece_notation(piece_type: str) -> str:
     }
     return piece_map.get(piece_type, piece_type)
 
-def position_to_fen(position: dict) -> str:
+def position_to_fen_improved(position: dict, previous_position: dict = None, move_context: dict = None) -> str:
     """
-    Convert position dictionary to FEN (Forsyth-Edwards Notation).
+    Convert position dictionary to FEN with improved game state inference.
+    
+    Args:
+        position: Current position dictionary
+        previous_position: Previous position for turn inference (optional)
+        move_context: Additional context like move number (optional)
     """
     fen_map = {
         'p_w': 'P', 'n_w': 'N', 'b_w': 'B', 'r_w': 'R', 'q_w': 'Q', 'k_w': 'K',
         'p_b': 'p', 'n_b': 'n', 'b_b': 'b', 'r_b': 'r', 'q_b': 'q', 'k_b': 'k',
         'empty': '1', 'error': '1', 'unknown': '1', 'empty_dot': '1'
     }
+    
+    # Build board FEN
     board_fen = []
     for rank_num in range(8, 0, -1):
         rank_str = ''
@@ -453,8 +460,22 @@ def position_to_fen(position: dict) -> str:
         if empty_count > 0:
             rank_str += str(empty_count)
         board_fen.append(rank_str)
-    fen = '/'.join(board_fen)
-    fen += " w KQkq - 0 1" # Default to white to move, standard castling, no en passant, etc.
+    
+    board_fen_str = '/'.join(board_fen)
+    
+    # Analyze position context
+    if move_context:
+        context = move_context
+    else:
+        context = analyze_position_context(position)
+    
+    # Infer turn if we have previous position
+    if previous_position is not None:
+        context['turn'] = infer_turn_from_position_sequence(position, previous_position)
+    
+    # Build complete FEN
+    fen = f"{board_fen_str} {context['turn']} {context['castling']} {context['en_passant']} {context['halfmove']} {context['fullmove']}"
+    
     return fen
 
 def _load_model_and_metadata(model_path: str) -> tuple[tf.keras.Model, list[str]]:
@@ -518,17 +539,99 @@ def _extract_preprocess_and_predict_squares(warped_img: np.ndarray, model: tf.ke
     predictions_from_model = model.predict(np.array(squares_batch_for_model), verbose=0, batch_size=64)
     return predictions_from_model, square_coords_for_mapping, sz
 
-def _build_results_from_predictions(
+# Add these improved functions to warped_to_fen.py to replace the existing position_to_fen function
+
+def analyze_position_context(position: dict) -> dict:
+    """
+    Analyze the chess position to infer game state information.
+    Returns a dictionary with inferred turn, castling rights, etc.
+    """
+    context = {
+        'turn': 'w',  # Default to white
+        'castling': 'KQkq',  # Default to all castling available
+        'en_passant': '-',
+        'halfmove': 0,
+        'fullmove': 1
+    }
+    
+    # Count pieces to get a rough estimate of game progress
+    white_pieces = sum(1 for piece in position.values() if piece.endswith('_w'))
+    black_pieces = sum(1 for piece in position.values() if piece.endswith('_b'))
+    total_pieces = white_pieces + black_pieces
+    
+    # Simple heuristic: if we have fewer pieces, we're later in the game
+    if total_pieces < 20:
+        context['fullmove'] = max(10, (32 - total_pieces) // 2)
+    elif total_pieces < 28:
+        context['fullmove'] = max(5, (32 - total_pieces) // 3)
+    
+    # Check castling rights based on piece positions
+    castling_rights = []
+    
+    # White castling
+    if position.get('e1') == 'k_w':  # White king on starting square
+        if position.get('h1') == 'r_w':  # Kingside rook
+            castling_rights.append('K')
+        if position.get('a1') == 'r_w':  # Queenside rook
+            castling_rights.append('Q')
+    
+    # Black castling
+    if position.get('e8') == 'k_b':  # Black king on starting square
+        if position.get('h8') == 'r_b':  # Kingside rook
+            castling_rights.append('k')
+        if position.get('a8') == 'r_b':  # Queenside rook
+            castling_rights.append('q')
+    
+    context['castling'] = ''.join(castling_rights) if castling_rights else '-'
+    
+    return context
+
+def infer_turn_from_position_sequence(current_position: dict, previous_position: dict = None) -> str:
+    """
+    Try to infer whose turn it is based on piece movement between positions.
+    This is a complex heuristic and may not always be accurate.
+    """
+    if previous_position is None:
+        return 'w'  # Default to white for starting position
+    
+    # Count pieces moved
+    white_changes = 0
+    black_changes = 0
+    
+    for square in set(list(current_position.keys()) + list(previous_position.keys())):
+        current_piece = current_position.get(square, 'empty')
+        previous_piece = previous_position.get(square, 'empty')
+        
+        if current_piece != previous_piece:
+            if current_piece.endswith('_w') or previous_piece.endswith('_w'):
+                white_changes += 1
+            if current_piece.endswith('_b') or previous_piece.endswith('_b'):
+                black_changes += 1
+    
+    # Simple heuristic: if white pieces moved more recently, it's black's turn
+    if white_changes > black_changes:
+        return 'b'
+    elif black_changes > white_changes:
+        return 'w'
+    else:
+        return 'w'  # Default to white if unclear
+
+
+def _build_results_from_predictions_improved(
         predictions_matrix: np.ndarray, 
         square_coords_for_mapping: list, 
         class_names: list, 
         orientation: int, 
         warped_img: np.ndarray, 
         square_size: int, 
+        previous_position: dict = None,
+        move_number: int = 1,
         debug: bool = False) -> tuple[dict, np.ndarray, str]:
-    """Builds position dict, visual overlay, and FEN from predictions."""
+    """
+    Improved version that tracks game state for better FEN generation.
+    """
     position = {}
-    visual = warped_img.copy() if debug else None # Only create visual if debugging
+    visual = warped_img.copy() if debug else None
     square_map = get_square_mapping(orientation)
 
     for i, (r_idx, c_idx) in enumerate(square_coords_for_mapping):
@@ -537,7 +640,7 @@ def _build_results_from_predictions(
         if predicted_class_index < len(class_names):
             piece_name = class_names[predicted_class_index]
         else:
-            piece_name = "unknown" # Fallback if index is out of bounds
+            piece_name = "unknown"
             print(f"Warning (analyze_chess_position): Predicted class index {predicted_class_index} out of bounds for class_names (len: {len(class_names)}).")
 
         position[square_map[(r_idx, c_idx)]] = piece_name
@@ -552,7 +655,16 @@ def _build_results_from_predictions(
             cv2.putText(visual, short_notation, (cx-10, cy+5),
                         cv2.FONT_HERSHEY_SIMPLEX, 0.7, text_color, 2)
 
-    fen_string = position_to_fen(position)
+    # Use improved FEN generation
+    move_context = {
+        'turn': 'w' if move_number % 2 == 1 else 'b',  # Alternate turns
+        'castling': 'KQkq',  # Will be analyzed by the function
+        'en_passant': '-',
+        'halfmove': 0,
+        'fullmove': (move_number + 1) // 2
+    }
+    
+    fen_string = position_to_fen_improved(position, previous_position, move_context)
     return position, visual, fen_string
 
 def _process_single_image_to_fen(image_path: str,
@@ -611,7 +723,7 @@ def _process_single_image_to_fen(image_path: str,
         return "8/8/8/8/8/8/8/8 w KQkq - 0 1" # Return empty FEN
 
     # Step 1: Build initial position_dict with default orientation (0) for refined orientation check
-    initial_position_dict, _, _ = _build_results_from_predictions(
+    initial_position_dict, _, _ = _build_results_from_predictions_improved(
         predictions_matrix, square_coords, class_names, orientation=0,
         warped_img=warped_board, square_size=square_size, debug=False # No visual overlay needed for this step
     )
@@ -634,7 +746,7 @@ def _process_single_image_to_fen(image_path: str,
         # This path is for potentially different/final debug outputs if needed, or just for consistency.
 
     try:
-        final_position_dict, visual_overlay, fen_string = _build_results_from_predictions(
+        final_position_dict, visual_overlay, fen_string = _build_results_from_predictions_improved(
             predictions_matrix, square_coords, class_names, final_orientation,
             warped_img=warped_board, square_size=square_size, debug=debug
         )

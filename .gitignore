@@ -18,3 +18,4 @@ piece_evaluator_model/models/chess_piece_model_new.keras(Version2)
 piece_evaluator_model/models/chess_piece_model.keras.metadata(Version1)
 piece_evaluator_model/models/chess_piece_model.keras(Version1)
 app/__pycache__/warped_to_fen.cpython-312.pyc
+app/test_videos/Blitz, Bishops, and History _ Develop Your Instincts _ 5-Minute Blitz _ GM Naroditsky's DYI Speedrun/compiled_game_data.json.backup_simple

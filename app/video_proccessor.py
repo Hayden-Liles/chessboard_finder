@@ -124,14 +124,11 @@ def _process_single_image_for_video_wrapper(args):
     timestamp_str = os.path.splitext(os.path.basename(image_path))[0]
     return timestamp_str, fen_string
 
-def generate_commentary_json(video_dir_path, model_path, output_json_path, num_workers=None):
+def generate_commentary_json_improved(video_dir_path, model_path, output_json_path, num_workers=None):
     """
-    Processes images in a video directory, links FENs with transcripts,
-    and generates a JSON output with commentary windows.
+    Enhanced version that tracks position history for better FEN generation.
     """
     imgs_dir = os.path.join(video_dir_path, "imgs")
-
-    # Determine the expected SRT file name based on the video directory name
     video_dir_basename = os.path.basename(video_dir_path)
     expected_srt_filename = f"{video_dir_basename}.srt"
     srt_file_path = os.path.join(video_dir_path, expected_srt_filename)
@@ -149,9 +146,7 @@ def generate_commentary_json(video_dir_path, model_path, output_json_path, num_w
         print(f"No images found in {imgs_dir}")
         return
 
-    # Prepare arguments for each image processing task
-    # Using default values for kmeans_sample_size, kmeans_iterations, morph_kernel_size
-    # These are the defaults in warped_to_fen.py's get_fen_from_image_or_dir
+    # Process images to get FEN observations (same as before)
     default_kmeans_sample_size = 5000
     default_kmeans_iterations = 30
     default_morph_kernel_size = 15
@@ -160,12 +155,12 @@ def generate_commentary_json(video_dir_path, model_path, output_json_path, num_w
     for img_file in image_files:
         image_path = os.path.join(imgs_dir, img_file)
         tasks.append((
-            image_path, model_path, False, # False for debug in FEN detection
+            image_path, model_path, False,
             default_kmeans_sample_size, default_kmeans_iterations, default_morph_kernel_size
         ))
 
     actual_num_workers = num_workers if num_workers is not None else os.cpu_count()
-    if actual_num_workers is None: # os.cpu_count() can return None
+    if actual_num_workers is None:
         actual_num_workers = 1 
         print("Warning: os.cpu_count() returned None, defaulting to 1 worker.")
     
@@ -176,19 +171,19 @@ def generate_commentary_json(video_dir_path, model_path, output_json_path, num_w
         results = pool.map(_process_single_image_for_video_wrapper, tasks)
 
     for i, (timestamp_str, fen_string) in enumerate(results):
-        original_img_file = image_files[i] # To get the original filename for logging
+        original_img_file = image_files[i]
         if fen_string and isinstance(fen_string, str):
             try:
                 timestamp_td = img_filename_to_timedelta(timestamp_str)
                 fen_observations.append({
-                    'timestamp_str': timestamp_str, # This is filename stem
+                    'timestamp_str': timestamp_str,
                     'fen': fen_string,
                     'timestamp_td': timestamp_td
                 })
             except ValueError as e:
-                print(f"    Could not parse timestamp from filename stem {timestamp_str} (original: {original_img_file}): {e}")
+                print(f"    Could not parse timestamp from filename stem {timestamp_str}: {e}")
         else:
-            print(f"    No valid FEN detected for {original_img_file} or error in processing. FEN: {fen_string}")
+            print(f"    No valid FEN detected for {original_img_file}")
 
     if not fen_observations:
         print("No FENs were successfully extracted from images.")
@@ -204,26 +199,35 @@ def generate_commentary_json(video_dir_path, model_path, output_json_path, num_w
     srt_data = parse_srt(srt_file_path)
     if not srt_data:
         print("SRT data is empty or could not be parsed.")
-        # Continue to create JSON but commentary will be empty
     
-    # Assign simple 0-based index to srt_data for easier windowing
     for i, entry in enumerate(srt_data):
         entry['srt_list_idx'] = i
 
     final_json_output = []
     print("Associating transcripts and building commentary windows...")
+    
+    # Track move numbers for better FEN generation
+    move_counter = 0
+    previous_fen = None
+    
     for fen_block in grouped_fen_blocks:
         fen_start_td = fen_block['start_td']
         fen_end_td = fen_block['end_td']
+        current_fen = fen_block['fen']
         
-        primary_srt_entries_info = [] # Store {'srt_list_idx': idx, 'text': text}
+        # Increment move counter if position changed
+        if previous_fen and previous_fen != current_fen:
+            move_counter += 1
+        elif previous_fen is None:
+            move_counter = 1
+        
+        primary_srt_entries_info = []
         for srt_entry in srt_data:
-            # Check for overlap: (StartA < EndB) and (EndA > StartB)
             if srt_entry['start_td'] < fen_end_td and srt_entry['end_td'] > fen_start_td:
                 primary_srt_entries_info.append(srt_entry)
         
         commentary_text = ""
-        if primary_srt_entries_info and srt_data: # Ensure srt_data is not empty
+        if primary_srt_entries_info and srt_data:
             min_primary_idx = min(e['srt_list_idx'] for e in primary_srt_entries_info)
             max_primary_idx = max(e['srt_list_idx'] for e in primary_srt_entries_info)
             
@@ -232,26 +236,23 @@ def generate_commentary_json(video_dir_path, model_path, output_json_path, num_w
             
             commentary_texts = [srt_data[i]['text'] for i in range(window_start_idx, window_end_idx + 1)]
             commentary_text = " ".join(commentary_texts).replace('\n', ' ').strip()
-        elif not srt_data:
-             print(f"  No SRT data available for FEN block starting {timedelta_to_srt_time_str(fen_start_td)}")
-        else:
-            print(f"  No primary transcript overlap for FEN block: {fen_block['fen']} from {timedelta_to_srt_time_str(fen_start_td)} to {timedelta_to_srt_time_str(fen_end_td)}")
 
-
+        # Enhanced output object with move tracking
         output_object = {
-            "fen": fen_block['fen'],
+            "fen": current_fen,
             "video_time_start_str": timedelta_to_srt_time_str(fen_start_td),
             "video_time_end_str": timedelta_to_srt_time_str(fen_end_td),
-            "move_num": 0,
+            "move_num": move_counter,  # Now properly tracked
             "eval_cp": 0,
             "best_move_san": "",
             "pv": [],
             "local_commentary_window": commentary_text
         }
         final_json_output.append(output_object)
+        previous_fen = current_fen
 
     print(f"Writing output to {output_json_path}...")
-    os.makedirs(os.path.dirname(output_json_path), exist_ok=True) # Ensure directory exists
+    os.makedirs(os.path.dirname(output_json_path), exist_ok=True)
     with open(output_json_path, 'w', encoding='utf-8') as f:
         json.dump(final_json_output, f, indent=4)
     
@@ -290,7 +291,7 @@ if __name__ == "__main__":
     # You can specify the number of workers, e.g., num_workers=4
     # If num_workers is None, it will try to use os.cpu_count()
     # If num_workers is 1, it will run sequentially (useful for debugging)
-    generate_commentary_json(video_directory, model_file_path, output_file_path, num_workers=None)
+    generate_commentary_json_improved(video_directory, model_file_path, output_file_path, num_workers=None)
 
 
     # --- Example of how to run for another video (if you have one) ---
