@@ -12,3 +12,9 @@
 hugging_face_upload.py
 */stockfish
 *.pkl
+*/chess_piece_model.*
+piece_evaluator_model/models/chess_piece_model_new.keras.metadata(Version2)
+piece_evaluator_model/models/chess_piece_model_new.keras(Version2)
+piece_evaluator_model/models/chess_piece_model.keras.metadata(Version1)
+piece_evaluator_model/models/chess_piece_model.keras(Version1)
+app/__pycache__/warped_to_fen.cpython-312.pyc
