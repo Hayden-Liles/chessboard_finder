@@ -1,14 +1,12 @@
-#!/usr/bin/env python3
 """
-Simple tool that ONLY fixes turn indicators without trying to reconstruct missing moves.
-This avoids the complexity that was causing errors.
+Enhanced tool that fixes turn indicators AND reconstructs missing positions.
 """
 
 import os
 import json
 import sys
 import argparse
-from typing import List, Dict, Tuple
+from typing import List, Dict, Tuple, Optional
 
 try:
     import chess
@@ -69,93 +67,247 @@ def analyze_game_sequence(fen_sequence: List[str]) -> Dict:
     
     return analysis
 
-def analyze_board_for_turn(fen: str, previous_fen: str = None) -> str:
+def find_intermediate_positions(from_board: chess.Board, to_board: chess.Board, max_depth: int = 3) -> List[chess.Board]:
     """
-    Analyze the board position to determine whose turn it should be.
-    Uses move count and position analysis rather than simple alternation.
+    Try to find intermediate positions between two board states.
+    Returns a list of boards representing the path from from_board to to_board.
     """
-    try:
-        board = chess.Board(fen)
+    from_fen = from_board.fen()
+    to_fen = to_board.fen()
+    
+    # Quick check: if boards are one move apart
+    for move in from_board.legal_moves:
+        test_board = from_board.copy()
+        test_board.push(move)
+        if test_board.board_fen() == to_board.board_fen():
+            return [test_board]
+    
+    # Analyze what changed to guide the search
+    from_pieces = {}
+    to_pieces = {}
+    
+    # Count pieces by type and color
+    for square in chess.SQUARES:
+        from_piece = from_board.piece_at(square)
+        to_piece = to_board.piece_at(square)
         
-        # If we have a previous position, try to infer from the move
-        if previous_fen:
-            try:
-                prev_board = chess.Board(previous_fen)
-                
-                # Count material changes to estimate who moved
-                white_pieces_prev = sum(1 for piece in prev_board.piece_map().values() if piece.color)
-                black_pieces_prev = sum(1 for piece in prev_board.piece_map().values() if not piece.color)
-                white_pieces_curr = sum(1 for piece in board.piece_map().values() if piece.color)
-                black_pieces_curr = sum(1 for piece in board.piece_map().values() if not piece.color)
-                
-                # Simple heuristic: if pieces changed, try to determine who moved last
-                if white_pieces_prev != white_pieces_curr or black_pieces_prev != black_pieces_curr:
-                    # Material changed, likely a capture - more complex analysis needed
-                    pass
-                else:
-                    # No material change, try to find the move
-                    for move in prev_board.legal_moves:
-                        test_board = prev_board.copy()
-                        test_board.push(move)
-                        if test_board.board_fen() == board.board_fen():
-                            # Found the move, return opposite color
-                            return 'b' if prev_board.turn else 'w'
-            except:
-                pass
-        
-        # Fallback: analyze position characteristics
-        # Count developed pieces and pawn moves to estimate game progress
-        white_developed = 0
-        black_developed = 0
-        white_pawns_moved = 0
-        black_pawns_moved = 0
-        
-        piece_map = board.piece_map()
-        
-        for square, piece in piece_map.items():
-            if piece.piece_type == chess.PAWN:
-                rank = chess.square_rank(square)
-                if piece.color:  # White
-                    if rank != 1:  # Not on starting rank
-                        white_pawns_moved += 1
-                else:  # Black
-                    if rank != 6:  # Not on starting rank
-                        black_pawns_moved += 1
-            elif piece.piece_type in [chess.KNIGHT, chess.BISHOP]:
-                rank = chess.square_rank(square)
-                if piece.color:  # White
-                    if rank > 0:  # Developed from back rank
-                        white_developed += 1
-                else:  # Black
-                    if rank < 7:  # Developed from back rank
-                        black_developed += 1
-        
-        # Simple heuristic based on development
-        total_white_activity = white_developed + white_pawns_moved
-        total_black_activity = black_developed + black_pawns_moved
-        
-        # If activities are equal or white is slightly ahead, it's probably black's turn
-        # If black is clearly ahead, it's probably white's turn
-        if total_black_activity > total_white_activity + 1:
-            return 'w'
-        else:
-            return 'b'
+        if from_piece:
+            key = (from_piece.piece_type, from_piece.color)
+            from_pieces[key] = from_pieces.get(key, 0) + 1
             
-    except:
-        # If all else fails, use fullmove number
-        parts = fen.split(' ')
-        if len(parts) >= 6:
-            try:
-                fullmove = int(parts[5])
-                # Odd fullmove = white's turn, even = black's turn (approximately)
-                return 'w' if (fullmove % 2 == 1) else 'b'
-            except:
-                pass
-        return 'w'  # Ultimate fallback
+        if to_piece:
+            key = (to_piece.piece_type, to_piece.color)
+            to_pieces[key] = to_pieces.get(key, 0) + 1
+    
+    # Determine which color likely moved by checking piece changes
+    white_changed = False
+    black_changed = False
+    
+    for key in set(list(from_pieces.keys()) + list(to_pieces.keys())):
+        from_count = from_pieces.get(key, 0)
+        to_count = to_pieces.get(key, 0)
+        if from_count != to_count:
+            piece_type, color = key
+            if color:  # White
+                white_changed = True
+            else:  # Black
+                black_changed = True
+    
+    # Try to find a path using BFS with limited depth
+    from collections import deque
+    
+    queue = deque([(from_board, [])])
+    visited = {from_board.board_fen()}
+    
+    while queue:
+        current_board, path = queue.popleft()
+        
+        if len(path) >= max_depth:
+            continue
+        
+        # Prioritize moves based on whose pieces changed
+        moves = list(current_board.legal_moves)
+        
+        # Sort moves to prioritize the color that needs to move
+        if white_changed and not black_changed and not current_board.turn:
+            # Black's turn but only white pieces changed - deprioritize
+            continue
+        elif black_changed and not white_changed and current_board.turn:
+            # White's turn but only black pieces changed - deprioritize  
+            continue
+            
+        for move in moves:
+            new_board = current_board.copy()
+            new_board.push(move)
+            board_fen = new_board.board_fen()
+            
+            if board_fen == to_board.board_fen():
+                # Found the target
+                return path + [new_board]
+            
+            # Check if this move gets us closer to the target
+            # by seeing if it matches any of the changes we need
+            move_is_promising = False
+            
+            # Check if the move affects squares that differ between from and to
+            from_square = move.from_square
+            to_square = move.to_square
+            
+            if (from_board.piece_at(from_square) != to_board.piece_at(from_square) or
+                from_board.piece_at(to_square) != to_board.piece_at(to_square)):
+                move_is_promising = True
+            
+            if move_is_promising and board_fen not in visited:
+                visited.add(board_fen)
+                queue.append((new_board, path + [new_board]))
+    
+    return []
 
-def fix_turn_indicators_smart(fen_sequence: List[str]) -> Tuple[List[str], List[str]]:
+def reconstruct_missing_positions(fen_sequence: List[str]) -> Tuple[List[str], List[str]]:
     """
-    Fix turn indicators using position analysis rather than simple alternation.
+    Reconstruct missing positions in a FEN sequence.
+    Returns the enhanced sequence and messages about what was done.
+    """
+    messages = []
+    enhanced_sequence = []
+    
+    for i, fen in enumerate(fen_sequence):
+        try:
+            board = chess.Board(fen)
+            enhanced_sequence.append(fen)
+            
+            # If not the last position, check if we need intermediate positions
+            if i < len(fen_sequence) - 1:
+                next_fen = fen_sequence[i + 1]
+                try:
+                    next_board = chess.Board(next_fen)
+                    
+                    # Check if there's a direct move
+                    direct_move = False
+                    for move in board.legal_moves:
+                        test_board = board.copy()
+                        test_board.push(move)
+                        if test_board.board_fen() == next_board.board_fen():
+                            direct_move = True
+                            break
+                    
+                    if not direct_move:
+                        # Intelligent reconstruction based on turn order
+                        reconstructed = smart_reconstruct_positions(board, next_board)
+                        
+                        if reconstructed:
+                            for j, (inter_board, move_desc) in enumerate(reconstructed):
+                                inter_fen = inter_board.fen()
+                                enhanced_sequence.append(inter_fen)
+                                messages.append(f"Inserted missing position after {i+1}: {move_desc}")
+                        else:
+                            messages.append(f"Could not reconstruct path between positions {i+1} and {i+2}")
+                            
+                except Exception as e:
+                    messages.append(f"Error processing next position {i+2}: {e}")
+                    
+        except Exception as e:
+            messages.append(f"Invalid FEN at position {i+1}: {e}")
+            enhanced_sequence.append(fen)  # Keep the original even if invalid
+    
+    return enhanced_sequence, messages
+
+def smart_reconstruct_positions(from_board: chess.Board, to_board: chess.Board) -> List[Tuple[chess.Board, str]]:
+    """
+    Intelligently reconstruct missing positions between two board states.
+    Returns a list of (board, move_description) tuples.
+    """
+    # First, analyze what changed between the positions
+    from_pieces = {}
+    to_pieces = {}
+    
+    # Map each square to its piece
+    for square in chess.SQUARES:
+        from_piece = from_board.piece_at(square)
+        to_piece = to_board.piece_at(square)
+        
+        if from_piece:
+            from_pieces[square] = from_piece
+        if to_piece:
+            to_pieces[square] = to_piece
+    
+    # Find differences
+    changed_squares = set()
+    for square in chess.SQUARES:
+        from_piece = from_pieces.get(square)
+        to_piece = to_pieces.get(square)
+        if from_piece != to_piece:
+            changed_squares.add(square)
+    
+    # Determine whose turn it is and what moves are needed
+    current_board = from_board.copy()
+    path = []
+    
+    # Try to find a sequence of moves that leads to the target
+    max_moves = 3  # Limit the search
+    moves_found = find_move_sequence(current_board, to_board, changed_squares, max_moves)
+    
+    for move in moves_found:
+        current_board.push(move)
+        move_desc = f"{current_board.san(move)} ({chess.square_name(move.from_square)}-{chess.square_name(move.to_square)})"
+        path.append((current_board.copy(), move_desc))
+    
+    # Remove the last position if it matches the target (to avoid duplication)
+    if path and path[-1][0].board_fen() == to_board.board_fen():
+        path = path[:-1]
+    
+    return path
+
+def find_move_sequence(from_board: chess.Board, to_board: chess.Board, changed_squares: set, max_depth: int) -> List[chess.Move]:
+    """
+    Find a sequence of moves that transforms from_board to to_board.
+    Uses the changed_squares hint to prioritize relevant moves.
+    """
+    from collections import deque
+    
+    # BFS to find the shortest sequence
+    queue = deque([(from_board, [])])
+    visited = {from_board.fen()}
+    
+    while queue:
+        current_board, moves = queue.popleft()
+        
+        if len(moves) >= max_depth:
+            continue
+        
+        # Get all legal moves
+        legal_moves = list(current_board.legal_moves)
+        
+        # Prioritize moves that affect changed squares
+        prioritized_moves = []
+        other_moves = []
+        
+        for move in legal_moves:
+            if move.from_square in changed_squares or move.to_square in changed_squares:
+                prioritized_moves.append(move)
+            else:
+                other_moves.append(move)
+        
+        # Try prioritized moves first
+        for move in prioritized_moves + other_moves:
+            new_board = current_board.copy()
+            new_board.push(move)
+            
+            # Check if we reached the target
+            if new_board.board_fen() == to_board.board_fen():
+                return moves + [move]
+            
+            # Continue searching
+            new_fen = new_board.fen()
+            if new_fen not in visited and len(moves) + 1 < max_depth:
+                visited.add(new_fen)
+                queue.append((new_board, moves + [move]))
+    
+    return []
+
+def fix_turn_indicators_with_context(fen_sequence: List[str]) -> Tuple[List[str], List[str]]:
+    """
+    Fix turn indicators using game context and proper move counting.
     """
     if not fen_sequence:
         return [], []
@@ -173,18 +325,13 @@ def fix_turn_indicators_smart(fen_sequence: List[str]) -> Tuple[List[str], List[
         
         original_turn = parts[1]
         
-        # Determine correct turn
-        if i == 0:
-            # First position - usually starting position should be white
-            correct_turn = 'w'
-        else:
-            # Use previous position to help determine turn
-            prev_fen = fixed_fens[-1] if fixed_fens else None
-            correct_turn = analyze_board_for_turn(fen, prev_fen)
+        # Determine correct turn based on position in sequence
+        # Starting position is white's turn, then alternates
+        correct_turn = 'w' if i % 2 == 0 else 'b'
         
         parts[1] = correct_turn
         
-        # Fix other basic FEN components if needed
+        # Fix other FEN components
         if len(parts) >= 3 and parts[2] not in ['K', 'Q', 'k', 'q', 'KQ', 'Kk', 'Qq', 'KQk', 'KQq', 'Kkq', 'Qkq', 'KQkq', '-']:
             parts[2] = 'KQkq'
         
@@ -192,7 +339,7 @@ def fix_turn_indicators_smart(fen_sequence: List[str]) -> Tuple[List[str], List[
             if len(parts[3]) != 2 or parts[3][0] not in 'abcdefgh' or parts[3][1] not in '36':
                 parts[3] = '-'
         
-        # Ensure we have 6 parts
+        # Fix move counters
         while len(parts) < 6:
             if len(parts) == 2:
                 parts.append('KQkq')
@@ -201,7 +348,18 @@ def fix_turn_indicators_smart(fen_sequence: List[str]) -> Tuple[List[str], List[
             elif len(parts) == 4:
                 parts.append('0')
             elif len(parts) == 5:
-                parts.append('1')
+                # Calculate fullmove number based on position
+                fullmove = (i // 2) + 1
+                parts.append(str(fullmove))
+        
+        # Update halfmove clock (simplified - reset on pawn move or capture)
+        if len(parts) >= 5:
+            parts[4] = '0'  # Simplified
+            
+        # Update fullmove number
+        if len(parts) >= 6:
+            fullmove = (i // 2) + 1
+            parts[5] = str(fullmove)
         
         fixed_fen = ' '.join(parts)
         
@@ -219,69 +377,9 @@ def fix_turn_indicators_smart(fen_sequence: List[str]) -> Tuple[List[str], List[
     
     return fixed_fens, messages
 
-def fix_turn_indicators_only(fen_sequence: List[str]) -> Tuple[List[str], List[str]]:
+def enhanced_repair_game(game_data: Dict, fix_missing: bool = True) -> int:
     """
-    Fix ONLY the turn indicators in FEN strings, without trying to reconstruct moves.
-    """
-    if not fen_sequence:
-        return [], []
-    
-    fixed_fens = []
-    messages = []
-    current_turn = 'w'  # Start with white
-    
-    for i, fen in enumerate(fen_sequence):
-        if not fen or not fen.strip():
-            continue
-        
-        parts = fen.split(' ')
-        if len(parts) < 2:
-            continue
-        
-        original_turn = parts[1]
-        parts[1] = current_turn
-        
-        # Fix other basic FEN components if needed
-        if len(parts) >= 3 and parts[2] not in ['K', 'Q', 'k', 'q', 'KQ', 'Kk', 'Qq', 'KQk', 'KQq', 'Kkq', 'Qkq', 'KQkq', '-']:
-            parts[2] = 'KQkq'
-        
-        if len(parts) >= 4 and parts[3] != '-':
-            if len(parts[3]) != 2 or parts[3][0] not in 'abcdefgh' or parts[3][1] not in '36':
-                parts[3] = '-'
-        
-        # Ensure we have 6 parts
-        while len(parts) < 6:
-            if len(parts) == 2:
-                parts.append('KQkq')
-            elif len(parts) == 3:
-                parts.append('-')
-            elif len(parts) == 4:
-                parts.append('0')
-            elif len(parts) == 5:
-                parts.append('1')
-        
-        fixed_fen = ' '.join(parts)
-        
-        # Validate the fixed FEN
-        try:
-            chess.Board(fixed_fen)
-            fixed_fens.append(fixed_fen)
-            
-            if original_turn != current_turn:
-                messages.append(f"Fixed turn indicator at position {i+1}: {original_turn} → {current_turn}")
-            
-            # Alternate turn for next position
-            current_turn = 'b' if current_turn == 'w' else 'w'
-            
-        except Exception as e:
-            messages.append(f"Could not fix FEN at position {i+1}: {e}")
-            continue
-    
-    return fixed_fens, messages
-
-def simple_repair_game(game_data: Dict, report_analysis: bool = True) -> int:
-    """
-    Simple repair that only fixes turn indicators and reports on missing moves.
+    Enhanced repair that fixes turn indicators AND reconstructs missing positions.
     """
     analysis_points = game_data.get("stockfish_analysis_points", [])
     if not analysis_points:
@@ -302,41 +400,68 @@ def simple_repair_game(game_data: Dict, report_analysis: bool = True) -> int:
     original_fens = [item['fen'] for item in original_data]
     print(f"    Original FENs: {len(original_fens)}")
 
-    # Fix turn indicators first using smart analysis
-    fixed_fens, fix_messages = fix_turn_indicators_smart(original_fens)
-    print(f"    After turn fix: {len(fixed_fens)} positions")
+    # Step 1: Reconstruct missing positions if requested
+    if fix_missing:
+        enhanced_fens, reconstruction_messages = reconstruct_missing_positions(original_fens)
+        if reconstruction_messages:
+            print(f"    Position reconstruction:")
+            for msg in reconstruction_messages[:5]:  # Show first 5 messages
+                print(f"      {msg}")
+            if len(reconstruction_messages) > 5:
+                print(f"      ... and {len(reconstruction_messages) - 5} more changes")
+    else:
+        enhanced_fens = original_fens
+
+    # Step 2: Fix turn indicators
+    fixed_fens, fix_messages = fix_turn_indicators_with_context(enhanced_fens)
+    print(f"    After repair: {len(fixed_fens)} positions")
 
     if fix_messages:
         turn_fixes = [msg for msg in fix_messages if "Fixed turn indicator" in msg]
         if turn_fixes:
             print(f"    Turn indicators fixed: {len(turn_fixes)}")
 
-    # NOW analyze the FIXED sequence to report issues
-    if report_analysis and fixed_fens:
-        analysis = analyze_game_sequence(fixed_fens)  # <- Use FIXED FENs!
-        print(f"    Valid positions: {analysis['valid_positions']}/{analysis['total_positions']}")
-        print(f"    Direct transitions: {analysis['direct_transitions']}")
-        if analysis['missing_moves']:
-            print(f"    Positions with missing moves: {len(analysis['missing_moves'])}")
-            # Show first few missing move gaps
-            for i, gap in enumerate(analysis['missing_moves'][:3]):
-                estimated = gap['estimated_missing']
-                from_idx = gap['from_index']
-                to_idx = gap['to_index']
-                print(f"      Gap {i+1}: Position {from_idx+1} → {to_idx+1} (estimated {estimated} missing moves)")
+    # Step 3: Analyze the final sequence
+    final_analysis = analyze_game_sequence(fixed_fens)
+    print(f"    Valid positions: {final_analysis['valid_positions']}/{final_analysis['total_positions']}")
+    print(f"    Direct transitions: {final_analysis['direct_transitions']}")
+    
+    remaining_gaps = len(final_analysis['missing_moves'])
+    if remaining_gaps > 0:
+        print(f"    Remaining gaps: {remaining_gaps}")
 
     # Create new analysis points with fixed FENs
     new_points = []
+    metadata_index = 0
+    
     for i, fen in enumerate(fixed_fens):
-        # Use original metadata if available
-        if i < len(original_data):
-            metadata = original_data[i]['metadata'].copy()
+        # Try to use original metadata if available
+        if metadata_index < len(original_data):
+            # Check if this position matches an original position
+            orig_board_fen = original_data[metadata_index]['fen'].split()[0]
+            curr_board_fen = fen.split()[0]
+            
+            if orig_board_fen == curr_board_fen:
+                # Use original metadata
+                metadata = original_data[metadata_index]['metadata'].copy()
+                metadata_index += 1
+            else:
+                # This is an inserted position
+                metadata = {
+                    "eval_cp": 0,
+                    "best_move_san": "",
+                    "pv": [],
+                    "local_commentary_window": "[Reconstructed position]",
+                    "video_time_start_str": "",
+                    "video_time_end_str": ""
+                }
         else:
+            # Beyond original data
             metadata = {
                 "eval_cp": 0,
                 "best_move_san": "",
                 "pv": [],
-                "local_commentary_window": "",
+                "local_commentary_window": "[Reconstructed position]",
                 "video_time_start_str": "",
                 "video_time_end_str": ""
             }
@@ -348,16 +473,12 @@ def simple_repair_game(game_data: Dict, report_analysis: bool = True) -> int:
         }
         new_points.append(new_point)
 
-    # Add back any non-FEN points
-    non_fen_points = [point for point in analysis_points if not point.get("fen")]
-    new_points.extend(non_fen_points)
-
     game_data["stockfish_analysis_points"] = new_points
     return len(fixed_fens)
 
-def simple_repair_compiled_game_data(file_path: str, report_analysis: bool = True) -> bool:
+def repair_compiled_game_data(file_path: str, fix_missing: bool = True) -> bool:
     """
-    Simple repair that only fixes turn indicators.
+    Repair compiled game data with optional missing position reconstruction.
     """
     if not os.path.exists(file_path):
         print(f"File not found: {file_path}")
@@ -374,7 +495,8 @@ def simple_repair_compiled_game_data(file_path: str, report_analysis: bool = Tru
         print("No games found in file")
         return False
     
-    print(f"Simple repair (turn indicators only) for {len(games_data)} games...")
+    repair_type = "Enhanced repair (turn indicators + missing positions)" if fix_missing else "Simple repair (turn indicators only)"
+    print(f"{repair_type} for {len(games_data)} games...")
     
     total_repaired = 0
     for i, game_data in enumerate(games_data):
@@ -382,7 +504,7 @@ def simple_repair_compiled_game_data(file_path: str, report_analysis: bool = Tru
         print(f"  Repairing game: {game_id}")
         
         try:
-            repaired_count = simple_repair_game(game_data, report_analysis)
+            repaired_count = enhanced_repair_game(game_data, fix_missing)
             if repaired_count > 0:
                 total_repaired += 1
                 print(f"    ✓ Repaired sequence: {repaired_count} positions")
@@ -392,7 +514,7 @@ def simple_repair_compiled_game_data(file_path: str, report_analysis: bool = Tru
             print(f"    ✗ Error repairing game: {e}")
     
     # Save the repaired data
-    backup_path = file_path + ".backup_simple"
+    backup_path = file_path + ".backup_enhanced" if fix_missing else file_path + ".backup_simple"
     try:
         # Create backup
         import shutil
@@ -403,7 +525,7 @@ def simple_repair_compiled_game_data(file_path: str, report_analysis: bool = Tru
         with open(file_path, 'w', encoding='utf-8') as f:
             json.dump(games_data, f, indent=4)
         
-        print(f"  ✓ Saved simple repair results")
+        print(f"  ✓ Saved repair results")
         print(f"  ✓ Repaired {total_repaired}/{len(games_data)} games")
         return True
         
@@ -412,19 +534,21 @@ def simple_repair_compiled_game_data(file_path: str, report_analysis: bool = Tru
         return False
 
 def main():
-    parser = argparse.ArgumentParser(description="Simple repair: fix turn indicators only, report missing moves.")
+    parser = argparse.ArgumentParser(description="Enhanced repair: fix turn indicators and reconstruct missing positions.")
     parser.add_argument("path", 
                         type=str, 
                         help="Path to compiled_game_data.json file or directory containing such files")
-    parser.add_argument("--no-analysis", 
+    parser.add_argument("--no-missing", 
                         action="store_true",
-                        help="Skip missing move analysis reporting")
+                        help="Skip missing position reconstruction (only fix turn indicators)")
     
     args = parser.parse_args()
     
+    fix_missing = not args.no_missing
+    
     if os.path.isfile(args.path):
         # Single file
-        simple_repair_compiled_game_data(args.path, report_analysis=not args.no_analysis)
+        repair_compiled_game_data(args.path, fix_missing)
     elif os.path.isdir(args.path):
         # Directory - find all compiled_game_data.json files
         repaired_count = 0
@@ -433,12 +557,12 @@ def main():
             if os.path.isdir(item_path):
                 compiled_data_path = os.path.join(item_path, "compiled_game_data.json")
                 if os.path.exists(compiled_data_path):
-                    print(f"\nSimple repair: {item}")
-                    if simple_repair_compiled_game_data(compiled_data_path, report_analysis=not args.no_analysis):
+                    print(f"\nRepairing: {item}")
+                    if repair_compiled_game_data(compiled_data_path, fix_missing):
                         repaired_count += 1
         
         print(f"\n{'='*60}")
-        print(f"Simple repair completed for {repaired_count} files")
+        print(f"Repair completed for {repaired_count} files")
         print(f"{'='*60}")
     else:
         print(f"Error: Path does not exist: {args.path}")

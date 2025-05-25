@@ -1,0 +1,22 @@
+{
+  "corner_points": [
+    [
+      280.0,
+      0.0
+    ],
+    [
+      639.0,
+      0.0
+    ],
+    [
+      639.0,
+      359.0
+    ],
+    [
+      280.0,
+      359.0
+    ]
+  ],
+  "detected_at_timestamp": "00:00:07,059",
+  "detection_method": "standard"
+}

@@ -267,7 +267,7 @@ if __name__ == "__main__":
     
     # Example video directory relative to BASE_PROJECT_DIR
     # Adjust this to your actual video directory name
-    video_folder_name = "Blitz, Bishops, and History _ Develop Your Instincts _ 5-Minute Blitz _ GM Naroditsky's DYI Speedrun"
+    video_folder_name = "2"
     video_directory = os.path.join(BASE_PROJECT_DIR, "app", "test_videos", video_folder_name)
     
     # Model path relative to BASE_PROJECT_DIR
