@@ -18,6 +18,7 @@ class ChessFENViewer:
         self.current_index = 0
         self.images = {}
         self.pil_images = {}  # Store PIL images separately
+        self.images_by_filename = {}  # New: Store images by filename
         
         # Create main window first
         self.root = tk.Tk()
@@ -72,17 +73,24 @@ class ChessFENViewer:
                 # Resize to fit display area while maintaining aspect ratio
                 pil_image.thumbnail((500, 400), Image.Resampling.LANCZOS)
                 
-                self.pil_images[i] = {
+                image_data = {
                     'pil_image': pil_image,
                     'timestamp': timestamp,
                     'filename': filename,
                     'path': image_path
                 }
                 
+                # Store by index (for backward compatibility)
+                self.pil_images[i] = image_data
+                
+                # Store by filename (for new source_images functionality)
+                self.images_by_filename[filename] = image_data
+                
             except Exception as e:
                 print(f"Error loading image {image_path}: {e}")
         
         print(f"Successfully loaded {len(self.pil_images)} images")
+        print(f"Images indexed by filename: {len(self.images_by_filename)}")
     
     def extract_timestamp(self, filename):
         """Extract timestamp from filename like '00-00-07.059.png'"""
@@ -118,6 +126,10 @@ class ChessFENViewer:
         self.fen_label = tk.Label(info_frame, text="", font=('Arial', 10), bg='white', wraplength=1300)
         self.fen_label.pack(pady=5)
         
+        # Video time label (new)
+        self.time_label = tk.Label(info_frame, text="", font=('Arial', 10), bg='white', fg='blue')
+        self.time_label.pack(pady=2)
+        
         # Navigation info
         nav_label = tk.Label(info_frame, text="Use ← → arrow keys to navigate", 
                            font=('Arial', 10), bg='white', fg='gray')
@@ -143,7 +155,7 @@ class ChessFENViewer:
             image_container = tk.Frame(content_frame, bg='white')
             image_container.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
             
-            image_title = tk.Label(image_container, text="Original Image", font=('Arial', 12, 'bold'), bg='white')
+            image_title = tk.Label(image_container, text="Source Image", font=('Arial', 12, 'bold'), bg='white')
             image_title.pack(pady=(0, 10))
             
             # Image display
@@ -231,56 +243,95 @@ class ChessFENViewer:
                 fen = current_data.get('fen', '')
                 move_num = current_data.get('move_num', self.current_index + 1)
                 timestamp = current_data.get('timestamp', None)
+                source_images = current_data.get('source_images', [])
+                video_time_start = current_data.get('video_time_start_str', '')
+                video_time_end = current_data.get('video_time_end_str', '')
+                commentary = current_data.get('local_commentary_window', '')
             elif isinstance(current_data, (list, tuple)) and len(current_data) >= 2:
                 fen = current_data[0]
                 move_num = current_data[1]
                 timestamp = current_data[2] if len(current_data) > 2 else None
+                source_images = []
+                video_time_start = ''
+                video_time_end = ''
+                commentary = ''
             else:
                 fen = str(current_data)
                 move_num = self.current_index + 1
                 timestamp = None
+                source_images = []
+                video_time_start = ''
+                video_time_end = ''
+                commentary = ''
             
             # Update labels
             self.move_label.config(text=f"Position {self.current_index + 1}/{len(self.fen_positions)} - Move: {move_num}")
             self.fen_label.config(text=f"FEN: {fen}")
+            
+            # Update time label
+            time_info = ""
+            if video_time_start and video_time_end:
+                if video_time_start == video_time_end:
+                    time_info = f"Video Time: {video_time_start}"
+                else:
+                    time_info = f"Video Time: {video_time_start} - {video_time_end}"
+            self.time_label.config(text=time_info)
             
             # Draw board
             self.draw_board(fen)
             
             # Update image if available
             if self.image_folder and hasattr(self, 'image_label'):
-                self.update_image_display(timestamp)
+                self.update_image_display(source_images, timestamp)
     
-    def update_image_display(self, timestamp=None):
-        """Update the image display"""
-        # Try to find matching image
-        image_index = None
+    def update_image_display(self, source_images=None, timestamp=None):
+        """Update the image display using source_images or fallback to timestamp"""
+        image_data = None
         
-        if timestamp:
-            # If we have timestamp info, try to find closest match
+        # First, try to use source_images (new method)
+        if source_images and len(source_images) > 0:
+            # Use the first source image
+            target_filename = source_images[0]
+            if target_filename in self.images_by_filename:
+                image_data = self.images_by_filename[target_filename]
+                image_key = f"filename_{target_filename}"
+            else:
+                print(f"Warning: Source image '{target_filename}' not found in loaded images")
+        
+        # Fallback to timestamp matching (old method)
+        if image_data is None and timestamp:
             image_index = self.find_closest_image_by_timestamp(timestamp)
-        else:
-            # If no timestamp, assume images are in same order as positions
-            if self.current_index < len(self.pil_images):
-                image_index = self.current_index
+            if image_index is not None and image_index in self.pil_images:
+                image_data = self.pil_images[image_index]
+                image_key = f"index_{image_index}"
         
-        if image_index is not None and image_index in self.pil_images:
-            image_data = self.pil_images[image_index]
-            
-            # Convert PIL image to ImageTk on demand (cache by index)
-            if image_index not in self.images:
+        # Final fallback: use position index
+        if image_data is None:
+            if self.current_index < len(self.pil_images):
+                image_data = self.pil_images[self.current_index]
+                image_key = f"index_{self.current_index}"
+        
+        # Display the image
+        if image_data:
+            # Convert PIL image to ImageTk on demand (cache by key)
+            if image_key not in self.images:
                 try:
                     tk_image = ImageTk.PhotoImage(image_data['pil_image'])
-                    self.images[image_index] = tk_image
+                    self.images[image_key] = tk_image
                 except Exception as e:
                     print(f"Error converting image to Tkinter format: {e}")
                     self.image_label.config(image="", text="Error loading image")
                     self.image_info_label.config(text="")
                     return
             
-            tk_image = self.images[image_index]
+            tk_image = self.images[image_key]
             self.image_label.config(image=tk_image, text="")
-            self.image_info_label.config(text=f"File: {image_data['filename']}")
+            
+            # Update info label
+            info_text = f"File: {image_data['filename']}"
+            if source_images and len(source_images) > 1:
+                info_text += f" (1 of {len(source_images)} source images)"
+            self.image_info_label.config(text=info_text)
         else:
             # Show placeholder
             self.image_label.config(image="", text="No matching image found")
@@ -382,7 +433,7 @@ def main():
     if not positions:
         print("Error: No positions found in the JSON file.")
         print("\nExpected JSON formats:")
-        print("1. Array of objects: [{'fen': '...', 'move_num': 1, 'timestamp': 123456}, ...]")
+        print("1. Array of objects: [{'fen': '...', 'move_num': 1, 'source_images': ['img1.png'], 'video_time_start_str': '...', ...}, ...]")
         print("2. Array of arrays: [['fen_string', move_num, timestamp], ...]")
         print("3. Array of strings: ['fen_string1', 'fen_string2', ...]")
         print("4. Object with positions array: {'positions': [...], 'other_data': '...'}")
@@ -391,6 +442,15 @@ def main():
     print(f"Loaded {len(positions)} positions from {args.json_file}")
     if args.images:
         print(f"Using images from: {args.images}")
+    
+    # Check if positions have source_images field
+    has_source_images = False
+    if positions and isinstance(positions[0], dict) and 'source_images' in positions[0]:
+        has_source_images = True
+        print("✓ Using source_images field for image matching")
+    else:
+        print("⚠ No source_images field found, falling back to timestamp/index matching")
+    
     print("Use ← → arrow keys to navigate between positions")
     print("Close the window or press Ctrl+C to exit")
     
