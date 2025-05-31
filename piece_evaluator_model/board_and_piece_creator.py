@@ -175,63 +175,67 @@ def draw_diagonal_arrow_on_square(draw, square_coords, arrow_color, head_height,
     shaft_width = int(overall_width * 0.5)
     shaft_width = shaft_width if shaft_width % 2 == 0 else shaft_width + 1
 
-    if direction == 'north_east':
-        # Arrowhead tip is at (cx_temp, cy_temp)
-        side_len = overall_width
-        h_offset = head_height
-        angle_arrowhead = -math.pi / 4 # North-East direction
-
-        # Rotate reference points around (0,0) and translate to (cx_temp, cy_temp)
-        ref_tip = (0, 0)
-        ref_base_x = -h_offset
-        ref_left = (ref_base_x, -side_len / 2)
-        ref_right = (ref_base_x, side_len / 2)
-
-        rot_ref_tip = rotate_point(ref_tip, angle_arrowhead, (0,0))
-        rot_ref_left = rotate_point(ref_left, angle_arrowhead, (0,0))
-        rot_ref_right = rotate_point(ref_right, angle_arrowhead, (0,0))
-
-        tri_tip = (cx_temp + rot_ref_tip[0], cy_temp + rot_ref_tip[1])
-        tri_left = (cx_temp + rot_ref_left[0], cy_temp + rot_ref_left[1])
-        tri_right = (cx_temp + rot_ref_right[0], cy_temp + rot_ref_right[1])
-
-        temp_draw.polygon([tri_tip, tri_left, tri_right], fill=arrow_color)
-
-        # For the shaft: It extends from the arrowhead base towards the SW corner of the square.
-        base_mid_x = (tri_left[0] + tri_right[0]) / 2
-        base_mid_y = (tri_left[1] + tri_right[1]) / 2
-
-        # Southwest corner of the temporary square (0,0) to (square_size, square_size)
-        sw_corner_x = 0
-        sw_corner_y = square_size
-
-        # Calculate angle of the shaft
-        shaft_angle = math.atan2(sw_corner_y - base_mid_y, sw_corner_x - base_mid_x)
-
-        # Calculate shaft length (from base_mid to the square boundary in the direction of the corner)
-        # This is tricky because we need to find the intersection point with the square's edge.
-        # A simpler way, given we are drawing on a clipped canvas, is to make the shaft long enough
-        # to guarantee it reaches the corner, and the clipping will handle the rest.
-        # Let's make the shaft extend slightly beyond the square's diagonal if needed.
-        # Max possible length for a diagonal in a square is sqrt(2) * side_size
-        shaft_len = math.sqrt(2) * square_size 
-
-        # Define points for a rectangle representing the shaft, originating from base_mid
-        # and extending in the direction of shaft_angle
-        # These points are relative to base_mid_x, base_mid_y
-        rect_p1_rel = (0, -shaft_width / 2)
-        rect_p2_rel = (shaft_len, -shaft_width / 2)
-        rect_p3_rel = (shaft_len, shaft_width / 2)
-        rect_p4_rel = (0, shaft_width / 2)
-
-        rotated_rect_points = []
-        for p_rel in [rect_p1_rel, rect_p2_rel, rect_p3_rel, rect_p4_rel]:
-            # Rotate points around (0,0) and then translate by (base_mid_x, base_mid_y)
-            rx = math.cos(shaft_angle) * p_rel[0] - math.sin(shaft_angle) * p_rel[1]
-            ry = math.sin(shaft_angle) * p_rel[0] + math.cos(shaft_angle) * p_rel[1]
-            rotated_rect_points.append((base_mid_x + rx, base_mid_y + ry))
+    # Define angles and target corners for each diagonal direction
+    direction_config = {
+        'north_east': {'angle': -math.pi / 4, 'target_corner': (0, square_size)},          # SW corner
+        'north_west': {'angle': -3 * math.pi / 4, 'target_corner': (square_size, square_size)}, # SE corner
+        'south_east': {'angle': math.pi / 4, 'target_corner': (0, 0)},                    # NW corner
+        'south_west': {'angle': 3 * math.pi / 4, 'target_corner': (square_size, 0)}      # NE corner
+    }
+    
+    if direction not in direction_config:
+        return
         
-        temp_draw.polygon(rotated_rect_points, fill=arrow_color)
+    config = direction_config[direction]
+    angle_arrowhead = config['angle']
+    target_corner_x, target_corner_y = config['target_corner']
+
+    # Arrowhead tip is at (cx_temp, cy_temp)
+    side_len = overall_width
+    h_offset = head_height
+
+    # Rotate reference points around (0,0) and translate to (cx_temp, cy_temp)
+    ref_tip = (0, 0)
+    ref_base_x = -h_offset
+    ref_left = (ref_base_x, -side_len / 2)
+    ref_right = (ref_base_x, side_len / 2)
+
+    rot_ref_tip = rotate_point(ref_tip, angle_arrowhead, (0,0))
+    rot_ref_left = rotate_point(ref_left, angle_arrowhead, (0,0))
+    rot_ref_right = rotate_point(ref_right, angle_arrowhead, (0,0))
+
+    tri_tip = (cx_temp + rot_ref_tip[0], cy_temp + rot_ref_tip[1])
+    tri_left = (cx_temp + rot_ref_left[0], cy_temp + rot_ref_left[1])
+    tri_right = (cx_temp + rot_ref_right[0], cy_temp + rot_ref_right[1])
+
+    temp_draw.polygon([tri_tip, tri_left, tri_right], fill=arrow_color)
+
+    # For the shaft: It extends from the arrowhead base towards the target corner of the square.
+    base_mid_x = (tri_left[0] + tri_right[0]) / 2
+    base_mid_y = (tri_left[1] + tri_right[1]) / 2
+
+    # Calculate angle of the shaft
+    shaft_angle = math.atan2(target_corner_y - base_mid_y, target_corner_x - base_mid_x)
+
+    # Calculate shaft length (from base_mid to the square boundary in the direction of the corner)
+    # Make the shaft long enough to guarantee it reaches the corner
+    shaft_len = math.sqrt(2) * square_size 
+
+    # Define points for a rectangle representing the shaft, originating from base_mid
+    # and extending in the direction of shaft_angle
+    rect_p1_rel = (0, -shaft_width / 2)
+    rect_p2_rel = (shaft_len, -shaft_width / 2)
+    rect_p3_rel = (shaft_len, shaft_width / 2)
+    rect_p4_rel = (0, shaft_width / 2)
+
+    rotated_rect_points = []
+    for p_rel in [rect_p1_rel, rect_p2_rel, rect_p3_rel, rect_p4_rel]:
+        # Rotate points around (0,0) and then translate by (base_mid_x, base_mid_y)
+        rx = math.cos(shaft_angle) * p_rel[0] - math.sin(shaft_angle) * p_rel[1]
+        ry = math.sin(shaft_angle) * p_rel[0] + math.cos(shaft_angle) * p_rel[1]
+        rotated_rect_points.append((base_mid_x + rx, base_mid_y + ry))
+    
+    temp_draw.polygon(rotated_rect_points, fill=arrow_color)
 
     # Paste the temporary square image onto the main high-resolution overlay
     draw.paste(temp_square_img, (square_x, square_y), temp_square_img)
@@ -387,7 +391,6 @@ def add_north_east_arrow_to_board(img, arrow_color, arrow_head_height_factor, ar
     scaled_w, scaled_h = w * draw_scale_factor, h * draw_scale_factor
     square_hires = scaled_w // 8
     overlay_hires = Image.new('RGBA', (scaled_w, scaled_h), (0, 0, 0, 0))
-    # No direct draw object here, as draw_diagonal_arrow_on_square now handles its own temporary draw surface
 
     for row in range(8):
         for col in range(8):
@@ -398,15 +401,112 @@ def add_north_east_arrow_to_board(img, arrow_color, arrow_head_height_factor, ar
             overall_width_hires = int(square_hires * arrow_width_factor)
             overall_width_hires = overall_width_hires if overall_width_hires % 2 == 0 else overall_width_hires + 1
 
-            # Call draw_diagonal_arrow_on_square which now draws and pastes
-            # onto the main overlay_hires
             draw_diagonal_arrow_on_square(
-                overlay_hires, # Pass the main overlay for pasting
+                overlay_hires,
                 (square_x_hires, square_y_hires, square_hires),
                 arrow_color,
                 head_height_hires,
                 overall_width_hires,
                 'north_east'
+            )
+
+    overlay_lores = overlay_hires.resize((w, h), Image.LANCZOS)
+    return Image.alpha_composite(img, overlay_lores)
+
+def add_north_west_arrow_to_board(img, arrow_color, arrow_head_height_factor, arrow_width_factor, draw_scale_factor=1):
+    """
+    Draw an arrow pointing North-West on every square of an 8x8 board image.
+    The arrowhead's tip is at the square's center, and the shaft extends from the southeast corner.
+    """
+    img = img.convert('RGBA')
+    w, h = img.size
+
+    scaled_w, scaled_h = w * draw_scale_factor, h * draw_scale_factor
+    square_hires = scaled_w // 8
+    overlay_hires = Image.new('RGBA', (scaled_w, scaled_h), (0, 0, 0, 0))
+
+    for row in range(8):
+        for col in range(8):
+            square_x_hires = col * square_hires
+            square_y_hires = row * square_hires
+
+            head_height_hires = int(square_hires * arrow_head_height_factor)
+            overall_width_hires = int(square_hires * arrow_width_factor)
+            overall_width_hires = overall_width_hires if overall_width_hires % 2 == 0 else overall_width_hires + 1
+
+            draw_diagonal_arrow_on_square(
+                overlay_hires,
+                (square_x_hires, square_y_hires, square_hires),
+                arrow_color,
+                head_height_hires,
+                overall_width_hires,
+                'north_west'
+            )
+
+    overlay_lores = overlay_hires.resize((w, h), Image.LANCZOS)
+    return Image.alpha_composite(img, overlay_lores)
+
+def add_south_east_arrow_to_board(img, arrow_color, arrow_head_height_factor, arrow_width_factor, draw_scale_factor=1):
+    """
+    Draw an arrow pointing South-East on every square of an 8x8 board image.
+    The arrowhead's tip is at the square's center, and the shaft extends from the northwest corner.
+    """
+    img = img.convert('RGBA')
+    w, h = img.size
+
+    scaled_w, scaled_h = w * draw_scale_factor, h * draw_scale_factor
+    square_hires = scaled_w // 8
+    overlay_hires = Image.new('RGBA', (scaled_w, scaled_h), (0, 0, 0, 0))
+
+    for row in range(8):
+        for col in range(8):
+            square_x_hires = col * square_hires
+            square_y_hires = row * square_hires
+
+            head_height_hires = int(square_hires * arrow_head_height_factor)
+            overall_width_hires = int(square_hires * arrow_width_factor)
+            overall_width_hires = overall_width_hires if overall_width_hires % 2 == 0 else overall_width_hires + 1
+
+            draw_diagonal_arrow_on_square(
+                overlay_hires,
+                (square_x_hires, square_y_hires, square_hires),
+                arrow_color,
+                head_height_hires,
+                overall_width_hires,
+                'south_east'
+            )
+
+    overlay_lores = overlay_hires.resize((w, h), Image.LANCZOS)
+    return Image.alpha_composite(img, overlay_lores)
+
+def add_south_west_arrow_to_board(img, arrow_color, arrow_head_height_factor, arrow_width_factor, draw_scale_factor=1):
+    """
+    Draw an arrow pointing South-West on every square of an 8x8 board image.
+    The arrowhead's tip is at the square's center, and the shaft extends from the northeast corner.
+    """
+    img = img.convert('RGBA')
+    w, h = img.size
+
+    scaled_w, scaled_h = w * draw_scale_factor, h * draw_scale_factor
+    square_hires = scaled_w // 8
+    overlay_hires = Image.new('RGBA', (scaled_w, scaled_h), (0, 0, 0, 0))
+
+    for row in range(8):
+        for col in range(8):
+            square_x_hires = col * square_hires
+            square_y_hires = row * square_hires
+
+            head_height_hires = int(square_hires * arrow_head_height_factor)
+            overall_width_hires = int(square_hires * arrow_width_factor)
+            overall_width_hires = overall_width_hires if overall_width_hires % 2 == 0 else overall_width_hires + 1
+
+            draw_diagonal_arrow_on_square(
+                overlay_hires,
+                (square_x_hires, square_y_hires, square_hires),
+                arrow_color,
+                head_height_hires,
+                overall_width_hires,
+                'south_west'
             )
 
     overlay_lores = overlay_hires.resize((w, h), Image.LANCZOS)
@@ -680,6 +780,216 @@ def add_north_east_arrow_to_piece(img, arrow_color, arrow_head_height_factor, ar
     overlay_lores = overlay_hires.resize((w, h), Image.LANCZOS)
     return Image.alpha_composite(img, overlay_lores)
 
+def add_north_west_arrow_to_piece(img, arrow_color, arrow_head_height_factor, arrow_width_factor, draw_scale_factor=1):
+    """
+    Draw a single arrow pointing North-West centered on the piece image.
+    The arrowhead's tip is at the piece's center, and the shaft extends from the southeast corner.
+    """
+    img = img.convert('RGBA')
+    w, h = img.size
+
+    scaled_w, scaled_h = w * draw_scale_factor, h * draw_scale_factor
+    overlay_hires = Image.new('RGBA', (scaled_w, scaled_h), (0, 0, 0, 0))
+    draw_hires = ImageDraw.Draw(overlay_hires)
+
+    cx_hires, cy_hires = scaled_w // 2, scaled_h // 2
+    base_dim_hires = min(scaled_w, scaled_h)
+
+    head_height_hires = int(base_dim_hires * arrow_head_height_factor)
+    overall_width_hires = int(base_dim_hires * arrow_width_factor)
+    overall_width_hires = overall_width_hires if overall_width_hires % 2 == 0 else overall_width_hires + 1
+
+    # Arrowhead tip is at (cx_hires, cy_hires)
+    side_len = overall_width_hires
+    h_offset = head_height_hires
+    angle_arrowhead = -3 * math.pi / 4 # North-West direction
+
+    # Rotate reference points around (0,0) and translate to (cx_hires, cy_hires)
+    ref_tip = (0, 0)
+    ref_base_x = -h_offset
+    ref_left = (ref_base_x, -side_len / 2)
+    ref_right = (ref_base_x, side_len / 2)
+
+    rot_ref_tip = rotate_point(ref_tip, angle_arrowhead, (0,0))
+    rot_ref_left = rotate_point(ref_left, angle_arrowhead, (0,0))
+    rot_ref_right = rotate_point(ref_right, angle_arrowhead, (0,0))
+
+    tri_tip = (cx_hires + rot_ref_tip[0], cy_hires + rot_ref_tip[1])
+    tri_left = (cx_hires + rot_ref_left[0], cy_hires + rot_ref_left[1])
+    tri_right = (cx_hires + rot_ref_right[0], cy_hires + rot_ref_right[1])
+
+    draw_hires.polygon([tri_tip, tri_left, tri_right], fill=arrow_color)
+
+    # For the shaft: It extends from the arrowhead base towards the SE corner of the piece.
+    base_mid_x = (tri_left[0] + tri_right[0]) / 2
+    base_mid_y = (tri_left[1] + tri_right[1]) / 2
+
+    # Southeast corner of the piece (bottom-right)
+    se_corner_x = scaled_w - 1 # Right edge of the high-res piece
+    se_corner_y = scaled_h - 1 # Bottom edge of the high-res piece
+
+    shaft_len = math.sqrt((se_corner_x - base_mid_x)**2 + (se_corner_y - base_mid_y)**2)
+    shaft_angle = math.atan2(se_corner_y - base_mid_y, se_corner_x - base_mid_x)
+
+    shaft_width_hires = int(overall_width_hires * 0.5)
+    shaft_width_hires = shaft_width_hires if shaft_width_hires % 2 == 0 else shaft_width_hires + 1
+
+    rect_p1 = (0, -shaft_width_hires / 2)
+    rect_p2 = (shaft_len, -shaft_width_hires / 2)
+    rect_p3 = (shaft_len, shaft_width_hires / 2)
+    rect_p4 = (0, shaft_width_hires / 2)
+
+    rotated_rect_points = []
+    for p in [rect_p1, rect_p2, rect_p3, rect_p4]:
+        rx = math.cos(shaft_angle) * p[0] - math.sin(shaft_angle) * p[1]
+        ry = math.sin(shaft_angle) * p[0] + math.cos(shaft_angle) * p[1]
+        rotated_rect_points.append((base_mid_x + rx, base_mid_y + ry))
+
+    draw_hires.polygon(rotated_rect_points, fill=arrow_color)
+
+    overlay_lores = overlay_hires.resize((w, h), Image.LANCZOS)
+    return Image.alpha_composite(img, overlay_lores)
+
+def add_south_east_arrow_to_piece(img, arrow_color, arrow_head_height_factor, arrow_width_factor, draw_scale_factor=1):
+    """
+    Draw a single arrow pointing South-East centered on the piece image.
+    The arrowhead's tip is at the piece's center, and the shaft extends from the northwest corner.
+    """
+    img = img.convert('RGBA')
+    w, h = img.size
+
+    scaled_w, scaled_h = w * draw_scale_factor, h * draw_scale_factor
+    overlay_hires = Image.new('RGBA', (scaled_w, scaled_h), (0, 0, 0, 0))
+    draw_hires = ImageDraw.Draw(overlay_hires)
+
+    cx_hires, cy_hires = scaled_w // 2, scaled_h // 2
+    base_dim_hires = min(scaled_w, scaled_h)
+
+    head_height_hires = int(base_dim_hires * arrow_head_height_factor)
+    overall_width_hires = int(base_dim_hires * arrow_width_factor)
+    overall_width_hires = overall_width_hires if overall_width_hires % 2 == 0 else overall_width_hires + 1
+
+    # Arrowhead tip is at (cx_hires, cy_hires)
+    side_len = overall_width_hires
+    h_offset = head_height_hires
+    angle_arrowhead = math.pi / 4 # South-East direction
+
+    # Rotate reference points around (0,0) and translate to (cx_hires, cy_hires)
+    ref_tip = (0, 0)
+    ref_base_x = -h_offset
+    ref_left = (ref_base_x, -side_len / 2)
+    ref_right = (ref_base_x, side_len / 2)
+
+    rot_ref_tip = rotate_point(ref_tip, angle_arrowhead, (0,0))
+    rot_ref_left = rotate_point(ref_left, angle_arrowhead, (0,0))
+    rot_ref_right = rotate_point(ref_right, angle_arrowhead, (0,0))
+
+    tri_tip = (cx_hires + rot_ref_tip[0], cy_hires + rot_ref_tip[1])
+    tri_left = (cx_hires + rot_ref_left[0], cy_hires + rot_ref_left[1])
+    tri_right = (cx_hires + rot_ref_right[0], cy_hires + rot_ref_right[1])
+
+    draw_hires.polygon([tri_tip, tri_left, tri_right], fill=arrow_color)
+
+    # For the shaft: It extends from the arrowhead base towards the NW corner of the piece.
+    base_mid_x = (tri_left[0] + tri_right[0]) / 2
+    base_mid_y = (tri_left[1] + tri_right[1]) / 2
+
+    # Northwest corner of the piece (top-left)
+    nw_corner_x = 0 # Left edge of the high-res piece
+    nw_corner_y = 0 # Top edge of the high-res piece
+
+    shaft_len = math.sqrt((nw_corner_x - base_mid_x)**2 + (nw_corner_y - base_mid_y)**2)
+    shaft_angle = math.atan2(nw_corner_y - base_mid_y, nw_corner_x - base_mid_x)
+
+    shaft_width_hires = int(overall_width_hires * 0.5)
+    shaft_width_hires = shaft_width_hires if shaft_width_hires % 2 == 0 else shaft_width_hires + 1
+
+    rect_p1 = (0, -shaft_width_hires / 2)
+    rect_p2 = (shaft_len, -shaft_width_hires / 2)
+    rect_p3 = (shaft_len, shaft_width_hires / 2)
+    rect_p4 = (0, shaft_width_hires / 2)
+
+    rotated_rect_points = []
+    for p in [rect_p1, rect_p2, rect_p3, rect_p4]:
+        rx = math.cos(shaft_angle) * p[0] - math.sin(shaft_angle) * p[1]
+        ry = math.sin(shaft_angle) * p[0] + math.cos(shaft_angle) * p[1]
+        rotated_rect_points.append((base_mid_x + rx, base_mid_y + ry))
+
+    draw_hires.polygon(rotated_rect_points, fill=arrow_color)
+
+    overlay_lores = overlay_hires.resize((w, h), Image.LANCZOS)
+    return Image.alpha_composite(img, overlay_lores)
+
+def add_south_west_arrow_to_piece(img, arrow_color, arrow_head_height_factor, arrow_width_factor, draw_scale_factor=1):
+    """
+    Draw a single arrow pointing South-West centered on the piece image.
+    The arrowhead's tip is at the piece's center, and the shaft extends from the northeast corner.
+    """
+    img = img.convert('RGBA')
+    w, h = img.size
+
+    scaled_w, scaled_h = w * draw_scale_factor, h * draw_scale_factor
+    overlay_hires = Image.new('RGBA', (scaled_w, scaled_h), (0, 0, 0, 0))
+    draw_hires = ImageDraw.Draw(overlay_hires)
+
+    cx_hires, cy_hires = scaled_w // 2, scaled_h // 2
+    base_dim_hires = min(scaled_w, scaled_h)
+
+    head_height_hires = int(base_dim_hires * arrow_head_height_factor)
+    overall_width_hires = int(base_dim_hires * arrow_width_factor)
+    overall_width_hires = overall_width_hires if overall_width_hires % 2 == 0 else overall_width_hires + 1
+
+    # Arrowhead tip is at (cx_hires, cy_hires)
+    side_len = overall_width_hires
+    h_offset = head_height_hires
+    angle_arrowhead = 3 * math.pi / 4 # South-West direction
+
+    # Rotate reference points around (0,0) and translate to (cx_hires, cy_hires)
+    ref_tip = (0, 0)
+    ref_base_x = -h_offset
+    ref_left = (ref_base_x, -side_len / 2)
+    ref_right = (ref_base_x, side_len / 2)
+
+    rot_ref_tip = rotate_point(ref_tip, angle_arrowhead, (0,0))
+    rot_ref_left = rotate_point(ref_left, angle_arrowhead, (0,0))
+    rot_ref_right = rotate_point(ref_right, angle_arrowhead, (0,0))
+
+    tri_tip = (cx_hires + rot_ref_tip[0], cy_hires + rot_ref_tip[1])
+    tri_left = (cx_hires + rot_ref_left[0], cy_hires + rot_ref_left[1])
+    tri_right = (cx_hires + rot_ref_right[0], cy_hires + rot_ref_right[1])
+
+    draw_hires.polygon([tri_tip, tri_left, tri_right], fill=arrow_color)
+
+    # For the shaft: It extends from the arrowhead base towards the NE corner of the piece.
+    base_mid_x = (tri_left[0] + tri_right[0]) / 2
+    base_mid_y = (tri_left[1] + tri_right[1]) / 2
+
+    # Northeast corner of the piece (top-right)
+    ne_corner_x = scaled_w - 1 # Right edge of the high-res piece
+    ne_corner_y = 0 # Top edge of the high-res piece
+
+    shaft_len = math.sqrt((ne_corner_x - base_mid_x)**2 + (ne_corner_y - base_mid_y)**2)
+    shaft_angle = math.atan2(ne_corner_y - base_mid_y, ne_corner_x - base_mid_x)
+
+    shaft_width_hires = int(overall_width_hires * 0.5)
+    shaft_width_hires = shaft_width_hires if shaft_width_hires % 2 == 0 else shaft_width_hires + 1
+
+    rect_p1 = (0, -shaft_width_hires / 2)
+    rect_p2 = (shaft_len, -shaft_width_hires / 2)
+    rect_p3 = (shaft_len, shaft_width_hires / 2)
+    rect_p4 = (0, shaft_width_hires / 2)
+
+    rotated_rect_points = []
+    for p in [rect_p1, rect_p2, rect_p3, rect_p4]:
+        rx = math.cos(shaft_angle) * p[0] - math.sin(shaft_angle) * p[1]
+        ry = math.sin(shaft_angle) * p[0] + math.cos(shaft_angle) * p[1]
+        rotated_rect_points.append((base_mid_x + rx, base_mid_y + ry))
+
+    draw_hires.polygon(rotated_rect_points, fill=arrow_color)
+
+    overlay_lores = overlay_hires.resize((w, h), Image.LANCZOS)
+    return Image.alpha_composite(img, overlay_lores)
+
 
 def process_boards(in_dir, out_dir,
                    dot_color, dot_radius_factor,
@@ -732,6 +1042,18 @@ def process_boards(in_dir, out_dir,
         north_east_arrow_dst = os.path.join(out_dir, f"{name}_arrow_north_east{ext}")
         north_east_arrow_img.save(north_east_arrow_dst)
 
+        north_west_arrow_img = add_north_west_arrow_to_board(img, arrow_color, arrow_head_height_factor, arrow_width_factor, draw_scale_factor)
+        north_west_arrow_dst = os.path.join(out_dir, f"{name}_arrow_north_west{ext}")
+        north_west_arrow_img.save(north_west_arrow_dst)
+
+        south_east_arrow_img = add_south_east_arrow_to_board(img, arrow_color, arrow_head_height_factor, arrow_width_factor, draw_scale_factor)
+        south_east_arrow_dst = os.path.join(out_dir, f"{name}_arrow_south_east{ext}")
+        south_east_arrow_img.save(south_east_arrow_dst)
+
+        south_west_arrow_img = add_south_west_arrow_to_board(img, arrow_color, arrow_head_height_factor, arrow_width_factor, draw_scale_factor)
+        south_west_arrow_dst = os.path.join(out_dir, f"{name}_arrow_south_west{ext}")
+        south_west_arrow_img.save(south_west_arrow_dst)
+
 
 def process_pieces(in_dir, out_dir,
                    ring_color, ring_radius_factor, ring_thickness_factor,
@@ -782,6 +1104,18 @@ def process_pieces(in_dir, out_dir,
             north_east_arrow_dst = os.path.join(target_dir, f"{name}_arrow_north_east{ext}")
             north_east_arrow.save(north_east_arrow_dst)
 
+            north_west_arrow = add_north_west_arrow_to_piece(img, arrow_color, arrow_head_height_factor, arrow_width_factor, draw_scale_factor)
+            north_west_arrow_dst = os.path.join(target_dir, f"{name}_arrow_north_west{ext}")
+            north_west_arrow.save(north_west_arrow_dst)
+
+            south_east_arrow = add_south_east_arrow_to_piece(img, arrow_color, arrow_head_height_factor, arrow_width_factor, draw_scale_factor)
+            south_east_arrow_dst = os.path.join(target_dir, f"{name}_arrow_south_east{ext}")
+            south_east_arrow.save(south_east_arrow_dst)
+
+            south_west_arrow = add_south_west_arrow_to_piece(img, arrow_color, arrow_head_height_factor, arrow_width_factor, draw_scale_factor)
+            south_west_arrow_dst = os.path.join(target_dir, f"{name}_arrow_south_west{ext}")
+            south_west_arrow.save(south_west_arrow_dst)
+
 
 if __name__ == '__main__':
     parser = argparse.ArgumentParser(
@@ -811,7 +1145,7 @@ if __name__ == '__main__':
     args = parser.parse_args()
 
     # Define a specific color for arrows, distinct from generic 'color' for other overlays
-    ARROW_COLOR = "255,170,0" # A nice orange-ish color
+    ARROW_COLOR = "255,170,0,200" # A nice orange-ish color
 
     dot_color = parse_color(args.color)
     ring_color = parse_color(args.color)
